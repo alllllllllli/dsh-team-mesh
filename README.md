@@ -1,0 +1,516 @@
+# dsh-team-mesh
+
+**跨 DSH 实例 / 跨设备**的任务协作插件（Windows 优先）。
+
+一个 DSH 实例里已经有 Agent Teams（`spawn_teammate`、任务板、Team UI），那是**实例内**的。
+这个插件补的是它没有的那一半：**不同 DSH 实例之间怎么派活、怎么交接、怎么验收** —— 而且验收这件事
+不接受模型自报，只认代码算得出来的物证。
+
+两种模式，共用同一套工具与同一条门禁：
+
+| 模式 | 板在哪 | 适用 |
+| --- | --- | --- |
+| **单机**（默认） | 本机 `$DSH_HOME/team/team.db` | 同一台机器上的多个 DSH 实例 |
+| **远端**（多设备） | 一台主机的板服务（HTTP），各设备连它 | 跨设备共用**同一块**板 |
+
+> **为什么需要远端模式**：板是本地 SQLite 文件，每台设备各写各的。
+> 实测过：设备A 建任务派给设备B，投递成功；设备B 报证据得到 `TASK_NOT_FOUND` ——
+> 任务在A的板里，B查的是自己的板。而且门禁要去磁盘读文件算哈希，
+> 对方机器上根本没有那个文件，跨机永远无法完成。
+> 远端模式把板挪到一处、把物证改成内容寻址，两个问题一起解掉。
+
+## 两种模式怎么选
+
+```yaml
+# 单机（不写 boardEndpoint 就是单机，行为与 0.1.0 完全一致）
+- id: dsh-team-mesh
+  config:
+    boardPath: 'C:\Users\you\.dsh\team\team.db'   # 可省，默认 $DSH_HOME/team/team.db
+
+# 远端（多设备共用一块板）
+- id: dsh-team-mesh
+  config:
+    boardEndpoint: 'http://127.0.0.1:13090'
+    boardToken: '<共享密钥，或留空走 DSH_TEAM_BOARD_TOKEN 环境变量>'
+    boardTimeoutMs: 10000
+```
+
+## 为什么可行（单机的关键前提）
+
+同一台机器上所有 DSH 实例共享 `DSH_HOME`。于是：
+
+- **共享任务板** = 一份 SQLite 文件 `$DSH_HOME/team/team.db`，谁写谁读都看见（WAL + `busy_timeout`）。
+- **通知** = 复用已有的 `dsh-interconnect` 服务（`ctx.interconnect`），把任务卡推到对端某个会话。
+
+不需要另造协议、不需要端口、不需要账号：这两样机器上都已经有了。
+
+## 工具（全部 `mesh_` 前缀）
+
+| 工具 | 作用 |
+| --- | --- |
+| `mesh_peers` | 列对端实例与链路状态；`includeSessions` 再列对端活会话 |
+| `mesh_task_create` | 在共享板上建任务（`requestId` 幂等） |
+| `mesh_task_list` | 列任务（按状态 / 负责人过滤）；显式标出 `STALE` / `ACK_TIMEOUT` |
+| `mesh_task_claim` | 认领 + **拿租约**（默认 10 分钟）；租约内不可被抢，stale 后可接管 |
+| `mesh_task_ack` | **收到任务卡后回执**，告诉派发方"有人接了" |
+| `mesh_task_heartbeat` | 续租，表示"我还在干"（建议 ≤5 分钟一次） |
+| `mesh_task_report` | 记录证据：`executed` / `outcome` / `note` / `evidenceRef` |
+| `mesh_task_complete` | 请求完成（门禁在写事务内重判） |
+| `mesh_task_cancel` | 取消（终态） |
+| `mesh_dispatch` | 把自包含任务卡推到对端实例的某个会话，并**开启回执窗口** |
+| `mesh_inbox` | 查看未读动态（按游标增量，不重复刷屏）；正常情况下会自动注入 |
+| `mesh_events` | 看审计事件流 |
+
+> **为什么用 `mesh_` 而不是 `team_`**：DSH 自带的 Agent Teams 已经占了 `team_task_create` /
+> `team_task_list` 这些名字。同名注册会互相遮蔽，所以刻意避让。
+
+## 四件事必须分开：投递 / 知情 / 干活 / 完成
+
+这是 v2 补的核心。v1 只做了前两件的"投递"，结果踩到真实的坑：
+**对端把活做完了，但它不会主动发消息，于是发起方一直不知道。**
+
+| 状态 | 怎么产生 | 谁看得见 |
+| --- | --- | --- |
+| **信没送到** | `mesh_dispatch` 返回 `delivered:false` | 投递方立刻看到原因 |
+| **送到了没人管** | 投递成功但 `ackTimeoutMs`（默认 60s）内无 `mesh_task_ack` | 扫出 `ack_state=timeout` + `task.ack_timeout` 事件 |
+| **有人接了但在干** | 收到 `mesh_task_ack` 并 `mesh_task_claim` | `ack_state=acked`，租约有效 |
+| **人挂了/跑偏** | 租约到期无 `mesh_task_heartbeat` | 标 `stale` + `lease.stale` 事件，**可被接管** |
+| **真的做完了** | 有可采信证据 + 门禁通过 | `lifecycle=done`，**下一轮自动注入**给发起方 |
+
+**这五种状态在 `mesh_task_list` 里用不同标记显示，不会被抹平成"正常"。**
+
+### 收件箱：发起方怎么"自动知情"
+
+不用模型主动查。插件挂在宿主的 `agent/pre-step` 上（内置"模型切换提示"用的同一个扩展点），
+在会话每一步之前：
+
+1. 先扫一遍过期的 ack / 租约（保证注入的是**现在**的真相）
+2. 取本会话游标之后的新事件
+3. 若是新增，追加一条摘要消息进本步上下文
+4. 游标前移到最后一条**已读**的 seq
+
+游标存在板上（`cursor` 表，主键 `instance_id + session_id`），所以：
+
+- 进程重启不丢，也不会重复刷屏
+- 多会话互不干扰
+- **注入失败游标不动**，下一轮能补上（宁可重复一次，也不永久丢）
+
+`config.inbox === false` 可关闭自动注入（排障用）。
+
+
+## 四条不变量（这是这个插件真正的价值）
+
+**远端模式下这四条一条都没有放松**，而且实现方式比单机更硬：
+
+1. **模型自报不算证据。** `mesh_task_report` 里 `executed` / `outcome` 是模型给的，
+   但**是否可采信由代码判定**：判 pass 必须给 `evidenceRef`，且物证得真的存在，
+   sha256 由代码实算。模型说"我保证成了"没有用。
+   - 单机：读本机磁盘算哈希。
+   - 远端：客户端只递**字节**，`sha256` 由**板服务**算，客户端连指定哈希的机会都没有。
+2. **没证据不能完成。** 空证据集、证据全不可采信、最后一条可采信证据是 `fail` 或 `unknown`，
+   四种情况一律拒绝，原因具体到代码（`NO_EVIDENCE` / `NO_ADMISSIBLE_EVIDENCE` / `LATEST_FAIL` / `LATEST_UNKNOWN`）。
+   - 远端：门禁跑在**板服务的写事务里**，客户端没有绕过路径。
+
+3. **被拒不吞审计。** 门禁拒绝的 `task.gate_rejected` 事件写在**另一笔已提交事务**里——
+   写在主事务里会被回滚吃掉（同一个坑在另一个项目已经踩过）。
+4. **投递成功 ≠ 任务完成。** `mesh_dispatch` 如实返回 `delivered` 与 `reason`
+   （`session-not-live` / `unreachable` / `peer-not-configured` …），绝不把没投出去说成派出去了。
+
+## 安装
+
+```powershell
+dsh plugin --profile <profile> add "file:F:\DeepSeek work space\dsh-team-plugin"
+```
+
+`dsh plugin` 只是把参数转给 pnpm；顺手会把 `dsh-team-mesh` 加到该 profile
+`package.json` 的 `dsh.profile.bundles` 里，插件因此进入合成树。
+
+### 当前状态：已装进 `desktop`（2026-11-07 18:55）
+
+```
+dsh plugin --profile desktop add "file:..."   → exit 0
+dsh.profile.bundles 末尾出现 dsh-team-mesh
+node_modules/dsh-team-mesh/ 落地，8 个关键文件与源哈希逐条一致
+```
+
+装之前备份了 `package.json.bak-20261107-185517-premesh` 与 `pnpm-lock.yaml.bak-...`。
+
+**生效需要重启 DSH**：`desktop` profile 由 Electron 应用独占管理，
+`dsh --profile desktop --dump-config` 会直接报
+`profile "desktop" is managed exclusively by the Electron application`，
+所以"合成树里有没有它"只能等应用重启后从插件页/工具列表确认。
+
+> pnpm 顺带把 `dsh-ops 0.4.4` 移除了（它本来就不在 bundles 里，属于之前遗留的孤立依赖）。
+> 如果发现哪个功能因此少了什么，用上面两个备份文件回滚。
+
+卸载：
+
+```powershell
+dsh plugin --profile desktop remove dsh-team-mesh
+```
+
+板文件位置：`$DSH_HOME\team\team.db`（默认，即 `C:\Users\admin\.dsh\team\team.db`）。
+要换位置，在 profile 里给插件加 `config: { boardPath: '...' }`。
+
+## 验证过什么（2026-11-07 本机实测）
+
+```
+node --test "test/*.test.mjs"      → 61 tests / 61 pass / 0 fail      （v1 39 + v2 22）
+node tools/e2e_remote.mjs          → 24 项跨机，0 失败                （A/B/C/D 四组）
+node tools/e2e_v2.mjs              → 29 项 v2，0 失败                 （a/b/c/d + d2 + 门禁）
+node tools/mutation_remote.mjs     → 6 个跨机变异全被抓，drift=0
+node tools/mutation_v2.mjs         → 7 个 v2 变异全被抓，drift=0
+node tools/mutation.mjs            → 5 个单机变异全被抓，drift=0
+node tools/smoke.mjs               → 13 项端到端，0 失败
+node tools/verify.mjs              → 16 项验收（源/装哈希一致等）
+node tools/client_cli.mjs health   → 板服务可达
+```
+
+### v2 的四项验收（`tools/e2e_v2.mjs`，29 项）
+
+| 组 | 验什么 | 结果 |
+| --- | --- | --- |
+| **a** | 投递成功但 60s 内无 ack → `ack_state=timeout`，留 `task.ack_timeout` 事件，列表显式标 `ACK_TIMEOUT`；且投递失败**不会**被误判成超时 | 5/5 |
+| **b** | claim 后停心跳 → 租约过期标 `stale` + `lease.stale` 事件，列表标 `STALE`，可被接管并留 `lease.taken_over` | 6/6 |
+| **c** | 对端完成但**不主动发消息** → 发起方下一轮经 `agent/pre-step` 自动看到 done 事件与任务状态 | 3/3 |
+| **d** | 连跑两轮：第二轮无新事件不注入；有新事件只注入新增；游标正确前移；按 session 隔离；注入失败游标不动 | 5/5 |
+| **d2** | 同上但走**真实钩子**路径（不是 `deliverInbox` 直调），含 `makeMessage` 抛错与 limit 截断 | 6/6 |
+| **门禁** | 四条不变量在 v2 下没有被放松 | 3/3 |
+
+### v2 变异测试（`tools/mutation_v2.mjs`，7/7）
+
+| 变异 | 改坏什么 | 结果 |
+| --- | --- | --- |
+| N1 | 超时不标 `ack_timeout`（永远 pending） | 被抓 |
+| N2 | 租约过期不标 `stale` | 被抓 |
+| N3 | stale 后仍不许接管 | 被抓 |
+| N4 | 注入后不前移游标（每轮刷屏） | 被抓 |
+| N5 | 游标跳到全表最大 seq（跳过中间事件） | 被抓 |
+| N6 | 注入失败也前移游标（消息永久丢） | 被抓 |
+| N7 | 列表不显示 STALE/ACK_TIMEOUT 标记 | 被抓 |
+
+**N4/N5/N6 第一次全部漏网。** 原因不是脚本坏了，而是我的 d 组测的是 `inbox.js` 的
+`deliverInbox`，而被变异的代码在 `inboxHook.js` —— **测的不是被改的那条路径**。
+补了 d2 组（走真实 `agent/pre-step` 钩子）后才 7/7。这条错误值得记：
+"测试全绿"和"测试覆盖到你改的那行"是两件事。
+
+
+### 跨机 e2e 的四组验收（`tools/e2e_remote.mjs`，24 项）
+
+| 组 | 验什么 | 结果 |
+| --- | --- | --- |
+| **A** | A建任务 → B看见 → B认领 → B报真实证据 → B完成 → A看到 done → 事件流可回放且顺序对 | 7/7 |
+| **B** | 无证据 / 自报无 ref / 路径不存在 / 伪造 blob 哈希 / blob 不自洽 / 哈希形状非法 —— 全拒且留痕 | 8/8 |
+| **C** | 断板、密钥错、服务中途停、对端只收不回：全部明确失败、可诊断、不卡死、不静默成功 | 4/4 |
+| **D** | 单机模式未被破坏（本地板同步可用、`file://` 与裸路径哈希一致） | 2/2 |
+
+其中 C 组是**最关键的一组**：它证明"连不上"不会变成一个假的成功。
+实测数据：板服务停掉后 `list` 在 **338ms** 内返回 `BOARD_UNREACHABLE` 并带诊断提示
+（"检查板服务是否在跑、隧道是否断开、endpoint 是否写对"）。
+
+### 跨机变异测试（`tools/mutation_remote.mjs`，6/6）
+
+"24 项全过"本身不算证据 —— 得证明这些测试真的会红。所以把实现故意改坏：
+
+| 变异 | 改坏什么 | 结果 |
+| --- | --- | --- |
+| M1 | 跨机时不上传物证，直接发本机路径 | 被抓（A组证据步骤红） |
+| M2 | `complete` 跳过门禁直接改状态 | 被抓（反例1红） |
+| M3 | 删掉 blob 哈希的形状校验 | 被抓（反例6红） |
+| M4 | 不校验 blob 的 key 与内容自洽 | 被抓（反例5红） |
+| M5 | 网络错误吞成"成功" | 被抓（C组断板红） |
+| M6 | 关掉共享密钥校验 | 被抓（C组密钥错红） |
+
+M3/M4 第一次**没被抓到** —— 因为当时的用例只覆盖了"形状合法但板上没有"这条路径，
+没有覆盖"形状非法"和"库里 key 与内容不自洽"。补了两条针对性用例后 6/6。
+这一步是必要的：如果不做变异测试，这两条防御纵深等于没测。
+
+- **契约**：9 个 spec 全部用**宿主真实的 `defineTool`**（从 `app.asar` 解出来的同一版本）编译通过；
+  另有一条反向对照，证明"用宿主不认的 schema 关键字会抛错"，以免这条测试变成摆设。
+- **门禁**：`working → done` 缺迁移、抢占、空证据、先过后挂、unknown、审计丢失——每一项都有用例，
+  而且对应变异确认会变红。
+
+
+### 在真实 DSH 宿主里跑通过（2026-11-07 18:44）
+
+装进隔离 profile 后启动该 profile，**板文件被真实创建**，这是 `apply()` 在宿主里跑成功的硬证据：
+
+```
+C:\Users\admin\.dsh\team\team.db        4096 B   创建于 18:44:51
+表: dispatch, event, evidence, meta, sqlite_sequence, task
+meta: [{"key":"schema_version","value":"1"}]
+journal_mode: wal
+```
+
+由此确认三件事，都不是推测：
+
+1. 宿主里 `import('@deepseek-ai/dsh-tools')` **能解析**，不需要 `DSH_TOOLS_PATH`。
+   （profile 的 `node_modules/@deepseek-ai/` 下只有 cosmokit 与 schemastery，没有 dsh-tools；
+   说明宿主加载插件时把自己的模块图暴露给了插件 —— `dsh-video-storyboard` 能工作也是同一个原因。）
+2. `apply(ctx, config)` 被调用且**没有走进我的 catch 分支**——走进去了只会返回空 disposer，
+   不会 `mkdir` + 建表。
+3. 建表 DDL 在真实宿主的 `node:sqlite`（Node 24.21）下执行成功，`journal_mode` 真的是 `wal`。
+
+## 远端模式：在第二台设备上开启
+
+三件事：主机起板服务 → 第二台设备配 endpoint → 用 CLI 确认通。
+
+### 1. 主机起板服务
+
+只有**一台**主机需要起它（板就住在这台上）。要不要占端口由你定，这里默认 `13090`，
+刻意避开 `13080/13081/13084/13085/13087`。
+
+```powershell
+# 密钥：两边必须一致。没有密钥时所有写操作会被拒绝（fail-closed，不是放开）
+$env:DSH_TEAM_BOARD_TOKEN = "<自己定一个足够长的随机串>"
+$env:DSH_TEAM_BOARD_PORT  = "13090"          # 可选，默认 13090
+$env:DSH_TEAM_BOARD_HOST  = "127.0.0.1"      # 走 SSH 隧道就绑回环，别直接暴露到 0.0.0.0
+$env:DSH_TEAM_BOARD_DB    = "C:\path\to\team.db"  # 可选，默认 $DSH_HOME/team/team.db
+
+node src/server.js
+```
+
+起来后会打印：
+
+```
+[board] listening on http://127.0.0.1:13090
+[board] db = C:\...\team.db
+[board] auth = token 已配置
+```
+
+> **为什么绑 127.0.0.1**：板服务本身没有 TLS。走 SSH 隧道时它只需要在本机回环上可达，
+> 对外由隧道负责加密。直接 `0.0.0.0` 暴露等于把明文密钥送出去。
+
+### 2. 第二台设备配 endpoint
+
+在第二台设备的 profile 里给插件加两项配置：
+
+```yaml
+- id: dsh-team-mesh
+  config:
+    boardEndpoint: 'http://127.0.0.1:13090'   # 隧道在本机落地的地址
+    boardToken: '<与主机相同的密钥>'
+```
+
+或用环境变量（避免密钥写进配置文件）：`DSH_TEAM_BOARD_ENDPOINT`、`DSH_TEAM_BOARD_TOKEN`。
+
+关键点：**`boardEndpoint` 指向的是"本机上隧道落地的那个地址"，不是主机的公网 IP。**
+本仓库验证时看到的就是这种形态 —— `127.0.0.1:13081` 实际是 `sshd` 在 `Listen`，
+`cordis.patch.yml` 里写明"经 PC 侧反向隧道落在本机 13081"。板服务同理，只是换个端口。
+
+装配期就会做一次 `/health` 自检：连不上、或密钥不对，**插件加载时直接报错并说明原因**，
+不会拖到模型第一次调用才炸。
+
+### 3. 确认真的通了（不用启动 DSH）
+
+```powershell
+$env:DSH_TEAM_BOARD_ENDPOINT = "http://127.0.0.1:13090"
+$env:DSH_TEAM_BOARD_TOKEN    = "<同一密钥>"
+
+node tools/client_cli.mjs health
+```
+
+期望看到 `✔ 板服务可达`、`service=dsh-team-mesh board`、`schema=1`。
+然后可以用 CLI 走完整闭环（这一步跨进程、跨机器都成立）：
+
+```powershell
+node tools/client_cli.mjs create --title "跨机测试"
+node tools/client_cli.mjs claim  --task t-xxxxxxxx
+node tools/client_cli.mjs report --task t-xxxxxxxx --ref "C:\path\proof.txt" --note "做完了"
+node tools/client_cli.mjs complete --task t-xxxxxxxx
+node tools/client_cli.mjs events --task t-xxxxxxxx
+```
+
+`report` 会给物证算哈希并打印**服务端算的**和**本地算的**两个值，两边必须一致：
+
+```
+已上传并按内容寻址：blob://sha256:60071572...7d88
+  sha256（服务端算）=60071572901e...ee7d88  52 字节
+  ✔ 两边一致
+```
+
+### 回滚到单机
+
+把 `boardEndpoint` 从配置里删掉（或注释掉），重启 DSH 即可。
+板服务可以一直停着 —— 单机模式根本不连它，行为与 0.1.0 完全一致：
+
+```powershell
+# 完全卸载
+dsh plugin --profile <profile> remove dsh-team-mesh
+```
+
+回滚不影响数据：单机的 `team.db` 一直在原地没被改动；远端板的数据在板服务那台机器上。
+
+## 跨机证据是怎么校验的（这块值得单独说）
+
+单机模式里 `evidenceRef` 是本机绝对路径，比如 `F:\proof.txt`。**这在别的机器上不存在**，
+于是门禁只会判"文件不存在"，跨机永远无法完成。
+
+远端模式改成两段：
+
+```
+产出端（B 机器）                        板服务（主机）                      验收端（A 机器）
+  本机文件 F:\proof.txt
+        │ 读字节
+        ▼
+  POST /blob/put  ────字节───────▶  自己算 sha256
+                                    存进 blob 表（key = sha256）
+                                           │
+                                    返回 blob://sha256:<hash>
+        ◀──────────────────────────────────┘
+        │ 用这个引用报证据
+        ▼
+  POST /task/report  ─────────────────▶  按 key 取字节、再算一次哈希核对
+                                           │ 自洽才判可采信
+                                           ▼
+                                    门禁通过 → done
+```
+
+关键性质：
+
+- **模型没有机会自报哈希。** 它只给一个本机路径或一段说明；哈希是板服务对字节算的。
+- **`blob://sha256:<hex>` 是内容寻址。** 引用本身就是哈希，所以"哈希不一致"这件事
+  在表示层就不可表达 —— 想伪造只能伪造一个板上不存在的 key，而那会被判"对象不存在"。
+- **防御纵深**：取出的字节还会再算一次哈希与 key 比对。就算 blob 表被人改过，
+  key 与内容不自洽也照样拒绝（有专门用例，见 `docs/evidence/`）。
+- **不存在的路径不会被"上传失败"变成合格证据。** 客户端只在 `fs.existsSync` 为真时上传；
+  不存在就原样发给服务端，由服务端判"不存在"并拒绝。
+
+## 没验证什么（不隐瞒）
+
+| 项 | 状态 | 原因 |
+| --- | --- | --- |
+| 真实两台物理机（各自独立的 DSH + 真实 SSH 隧道）跨机闭环 | **部分** | 已验证：板服务独立进程 + 两个独立 CLI 进程跨进程闭环、哈希两端一致。真实的跨机器隧道由用户侧安排，未在此环境实测 |
+| 真实两个 DSH 实例之间的 `mesh_dispatch` | **未实测** | 需要第二个实例加载本插件并重启；会打扰用户正在用的实例 |
+| 对端会话被唤醒（`resume: true`）的行为 | **未实测** | 会真的花对端的模型额度 |
+| 并发的两个实例同时认领 | **部分** | 用两个 `Board` 指向同一文件 + 两个 CLI 进程验了互斥；没做高并发时序压力测试 |
+| 板服务长期运行的稳定性（内存/连接泄漏） | **未验** | 只做了秒级验证，没有长跑 |
+| Linux/macOS | 未验 | 本次范围只要 Windows |
+
+
+## 我要怎么测
+
+分三层，从便宜到贵。**第 1 层不用重启、不用花钱**，出问题基本都在那里。
+
+### 第 1 层：环境检查（10 秒，随时可跑）
+
+```powershell
+cd "F:\DeepSeek work space\dsh-team-plugin"
+node tools/verify.mjs
+```
+
+它按证据强弱查 16 项，全绿才说明"装对了 + 加载了 + 在跑"：
+
+| 查什么 | 不过说明什么 |
+| --- | --- |
+| 源码与装入副本哈希一致 | **最常见**：改过代码但副本是旧的（`pnpm add` 会判"已最新"而跳过，必须 `remove` 再 `add`） |
+| 副本声明了 `inject: interconnect` | 跨实例派活会不可用（`ctx.interconnect` 读到 undefined） |
+| profile 的 dependencies 与 bundles 都有它 | 装了但没进组合，宿主不会加载 |
+| 板文件存在 + 表齐全 + WAL | `apply()` 没跑过 → 没重启，或走进了 catch 分支 |
+| 事件表有内容 | 插件加载了但事件订阅没生效 |
+| 有可采信证据 | 门禁闭环没真正跑过 |
+
+### 第 2 层：在会话里让模型真调（验证"工具对模型可见"）
+
+这一步只能在新会话里做，因为工具列表在会话启动时固定。**随便开一个新会话**，说：
+
+> 用 mesh_task_create 建一个任务，标题叫"测试"，然后 mesh_task_list 列出来
+
+看到建出 `t-xxxxxxxx` 并能列出来，就说明工具真的注册到模型侧了。
+
+想验门禁，接着按这个顺序说（每一步的**预期**都写好了，对不上就是有问题）：
+
+| 你说 | 预期结果 |
+| --- | --- |
+| `mesh_task_complete`（不报证据直接完成） | 拒绝，原因含 `NO_EVIDENCE` |
+| `mesh_task_report` executed=true, outcome=pass, note="我保证做完了"（**不给 evidenceRef**） | 记录成功但**可采信：否**，理由"判 pass 但没有 evidenceRef" |
+| `mesh_task_complete` 再试一次 | 仍然拒绝，原因含 `NO_ADMISSIBLE_EVIDENCE` |
+| `mesh_task_report` 带一个真实文件的绝对路径 + outcome=pass | **可采信：是**，并打印实算的 sha256 |
+| 自己用 `Get-FileHash` 算同一个文件 | 两个哈希**必须一致**——一致才证明它是真读盘算的，不是抄模型自报的 |
+| `mesh_task_complete` | 完成，状态 `done` |
+
+### 第 3 层：跨实例派活（最贵，会打扰另一个实例）
+
+```powershell
+# 另开一个 DSH 实例（比如 headless profile），确认它也有本插件
+dsh plugin --profile headless add "file:F:\DeepSeek work space\dsh-team-plugin"
+```
+
+然后在会话里：
+
+> 用 mesh_peers 带上 includeSessions，告诉我有哪些对端和活会话
+
+能列出 `pc-ky614` 与它的会话 id，就说明 `ctx.interconnect` 通了。
+再用 `mesh_dispatch` 把任务派到那个会话 id，看返回的是 `已投递` 还是 `未投递 + 原因`
+（`session-not-live` / `unreachable` / `peer-not-configured`）。
+
+### 只想看板里有什么
+
+```powershell
+node tools/verify.mjs          # 含最近 6 条事件
+```
+
+或者直接读 `C:\Users\admin\.dsh\team\team.db`（SQLite，WAL 模式）。
+
+### 回归：不能压坏原有功能
+
+```powershell
+node --test "test/*.test.mjs"      # 39 tests，应全绿
+node tools/mutation.mjs            # 5 个单机变异必须全被抓、drift=0
+node tools/smoke.mjs               # 13 项端到端
+node tools/e2e_remote.mjs          # 24 项跨机（A/B/C/D 四组）
+node tools/mutation_remote.mjs     # 6 个跨机变异必须全被抓、drift=0
+```
+
+## 实测记录：踩到并修掉的四个真问题
+
+**① `pnpm add` 不会更新已装的 `file:` 依赖。** 改完源码直接 `dsh plugin add` 输出 `Already up to date`，
+装入副本的哈希仍是旧的 —— 重启也不会生效。**必须 `remove` 再 `add`**，并用 `verify.mjs` 的哈希对照确认。
+
+**② `inject` 少写一个服务，跨实例派活会静默失效。** 最初写的是 `inject: ['tools']`，
+结果 `mesh_peers` 报"本实例上没有 interconnect 服务"，但同一时刻 `peer.event` 事件照收不误
+——因为订阅事件走 `ctx.on`（不要求注入），读 Service 走 `ctx.interconnect`（**要求注入**）。
+两者表现不一致正好把它暴露出来。改成 `inject: ['tools', 'interconnect']`。
+
+**③ 变异测试第一次没抓到两条防御纵深。** 跨机变异里 M3（删掉 blob 哈希形状校验）和
+M4（不校验 key 与内容自洽）**首次全部漏网** —— 因为当时的用例只覆盖"形状合法但板上没有"，
+没覆盖"形状非法"和"库里 key 与内容不自洽"。补了两条针对性用例后 6/6。
+教训：变异测试不是走形式，它恰好指出"哪些代码写了但从没被执行过"。
+
+**④ 反例用例一度因为别的原因失败，看起来却像通过。** 用 CLI 测"路径不存在"时忘了给 `--note`，
+结果报的是 `INVALID_FIELD: note 不能为空` —— 它**确实失败了**，但失败原因不对，
+等于那条证据校验根本没被测到。补上 note 后才真正验到 `evidenceRef 文件不存在`。
+
+## 开发
+
+`@deepseek-ai/dsh-tools` 打在 `app.asar` 里，普通 node 进程 import 不到。
+`tools/vendor_deps.mjs` 会把它连同依赖从 asar 解到 `vendor/node_modules/`（迭代解析缺包），
+契约测试就用这一份真实 `defineTool`。
+
+```powershell
+node tools/vendor_deps.mjs        # 解 dsh-tools 及其依赖（约 11 个包）
+node --test "test/*.test.mjs"     # 全量测试
+node tools/mutation.mjs           # 单机变异测试
+node tools/smoke.mjs              # 端到端冒烟（不启动 DSH）
+node tools/e2e_remote.mjs         # 跨机 e2e（自己起板服务，随机端口）
+node src/server.js                # 起板服务
+node tools/client_cli.mjs health  # 板服务运维客户端
+```
+
+- `tools/asar.mjs` — 零依赖 asar 读取器（`list` / `extract`）。头部布局踩过坑，注释里写了实测值。
+- `DSH_TEAM_DEBUG=1` — 让 `apply()` 把加载错误抛出来（默认吞掉并记日志，因为插件坏了不该让应用起不来）。
+- `DSH_TOOLS_PATH` — 本地开发时指向 `dsh-tools/lib/index.js`，让 `apply()` 能解析到它。
+- `DSH_TEAM_BOARD_TOKEN` / `DSH_TEAM_BOARD_PORT` / `DSH_TEAM_BOARD_DB` — 板服务的配置。
+- `DSH_TEAM_BOARD_ENDPOINT` / `DSH_TEAM_BOARD_TOKEN` — 客户端配置（CLI 用）。
+
+## 已知限制
+
+- 单机模式下板是**单机共享**的（跨机请用远端模式，见上文）。网络盘共享 SQLite **不推荐**：
+  SQLite over SMB 的锁不可靠，WAL 尤其容易损坏。
+- 远端模式**只有一个板服务**（单点）。板服务停了，所有设备的写操作都会失败 —— 但它是
+  **明确失败**（`BOARD_UNREACHABLE`），不是静默成功。没有做多副本 / 故障转移。
+- 远端模式**没有租约/超时回收**：一个被认领后死掉的任务会一直挂在 `working`。
+- 没有成员/角色概念：只有会话（session）与任务。原型阶段刻意不引入。
+- `dispatch` 不跟踪回执：任务卡发出去后，对端是否真的动了手，只能看共享板上的证据与事件。
+- blob 目前**只增不删**：没有垃圾回收，长期运行需要手工清理不用的 blob。
+- 板服务没有速率限制 / 审计日志落盘（只在 SQLite 里）。

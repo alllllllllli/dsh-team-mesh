@@ -1,0 +1,12 @@
+{
+  "name": "dsh-team-mesh",
+  "description": "Cross-instance and cross-device task mesh for DeepSeek-Harness: shared SQLite board or remote HTTP board service, interconnect dispatch with ack receipts, claim leases with heartbeat, auto-injected inbox cursor, and a completion gate that refuses model self-reports.",
+  "version": "0.3.0-prototype",
+  "entry": {
+    "name": "dsh-team-mesh",
+    "inject": [
+      "tools",
+      "interconnect"
+    ]
+  }
+}

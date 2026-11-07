@@ -1,0 +1,71 @@
+{
+  "name": "dsh-team-mesh",
+  "version": "0.3.0-prototype",
+  "description": "Cross-instance and cross-device task mesh for DeepSeek-Harness: shared SQLite board or remote HTTP board service, interconnect dispatch with ack receipts, claim leases with heartbeat, auto-injected inbox cursor, and a completion gate that refuses model self-reports.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "multi-agent",
+    "task-board",
+    "interconnect",
+    "multi-device"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./spec": "./src/spec.js",
+    "./domain": "./src/domain.js",
+    "./store": "./src/store.js",
+    "./backend": "./src/backend.js",
+    "./remote": "./src/remote.js",
+    "./server": "./src/server.js",
+    "./refs": "./src/refs.js",
+    "./package.json": "./package.json",
+    "./inbox": "./src/inbox.js",
+    "./inboxHook": "./src/inboxHook.js"
+  },
+  "files": [
+    "src",
+    "tools",
+    "docs",
+    "cordis.patch.yml",
+    "dsh.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "test:remote": "node tools/e2e_remote.mjs",
+    "contract": "node test/contract.test.mjs",
+    "board": "node src/server.js",
+    "verify": "node tools/verify.mjs",
+    "mutation": "node tools/mutation.mjs",
+    "mutation:remote": "node tools/mutation_remote.mjs",
+    "vendor": "node tools/vendor_deps.mjs",
+    "test:v2": "node tools/e2e_v2.mjs",
+    "mutation:v2": "node tools/mutation_v2.mjs",
+    "test:all": "node --test \"test/*.test.mjs\" && node tools/e2e_remote.mjs && node tools/e2e_v2.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "dsh-interconnect": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
