@@ -178,7 +178,14 @@ export function dispatchSpec() {
     description: [
       '把任务派给**另一台/另一个 DSH 实例上的某个会话**：通过 interconnect 发一张自包含的任务卡。',
       '',
-      '先 mesh_peers({ includeSessions: true }) 拿到 instanceId 与会话 id，再派。',
+      '两种派法：',
+      '  A) 投给**现成会话**：给 sessionId（来自 mesh_peers({ includeSessions: true })）。',
+      '  B) 让对端**新建一个会话**再投：newSession=true，不给 sessionId。',
+      '     适合"对端只有一个活会话、所有任务都堵在它那里"的情形 ——',
+      '     新建出来的会话专属这条任务，不会和别的活抢同一个上下文。',
+      '     注意：必须对端开了 allowCreate 才可用（默认关闭）。被拒时会给明确原因，',
+      '     **不会**偷偷改投给现成会话。',
+      '',
       '投递结果**如实返回**：delivered=false 时会给 reason（session-not-live / unreachable /',
       'peer-not-configured 等），不要把它当成派成功。',
       '',
@@ -191,7 +198,28 @@ export function dispatchSpec() {
     parameters: {
       taskId: { type: 'string', required: true, description: '要派的任务 id' },
       instanceId: { type: 'string', required: true, description: '对端实例 id（来自 mesh_peers）' },
-      sessionId: { type: 'string', required: true, description: '对端会话 id（来自 mesh_peers 的会话列表）' },
+      sessionId: {
+        type: 'string',
+        description: '对端会话 id（来自 mesh_peers 的会话列表）。newSession=true 时不要给',
+      },
+      newSession: {
+        type: 'boolean',
+        description:
+          '让对端新建一个会话再投（默认 false）。为 true 时不要给 sessionId；' +
+          '建不出来会如实报错，不会降级投给现成会话。需要对端 allowCreate=true',
+      },
+      cwd: {
+        type: 'string',
+        description: '仅 newSession=true：新会话的工作目录（不给就用对端默认目录）',
+      },
+      agentPreset: {
+        type: 'string',
+        description: '仅 newSession=true：新会话使用的 agent preset（不给就用对端默认）',
+      },
+      title: {
+        type: 'string',
+        description: '仅 newSession=true：给新会话的建议标题（默认用任务标题，便于在对端列表里认出来）',
+      },
       resume: { type: 'boolean', description: '对端会话已休眠时是否唤醒它（默认 false，会花对方额度）' },
       delivery: {
         type: 'string',
@@ -199,7 +227,7 @@ export function dispatchSpec() {
       },
       ackTimeoutMs: {
         type: 'integer',
-        description: '等回执的时限（毫秒，默认 60000）。超时未回执判 ack_timeout',
+        description: '等回执的时限（毫秒，默认 60000）。超时未回执判 ack_timeout；newSession 时也用作建会话的时限',
       },
     },
     output: textOut,
@@ -262,6 +290,13 @@ export function inboxSpec() {
       limit: { type: 'integer', description: '最多取几条未读事件，1-100（默认 20）' },
       peek: { type: 'boolean', description: '只看不移游标（默认 false：查看后游标会前移）' },
       reset: { type: 'boolean', description: '把游标重置到 0 再读（排障用）' },
+      excludeKinds: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          '要排除的事件种类（默认 ["peer.event"]）。传 [] 表示不过滤，会看到全部事件。' +
+          '被排除的事件仍会让游标正常前进，不会堵住后面的任务事件。',
+      },
     },
     output: textOut,
   };

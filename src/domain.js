@@ -187,6 +187,40 @@ export const DEFAULT_LEASE_MS = 10 * 60_000;
 /** 心跳最大间隔建议值：5 分钟（租约的三分之一留足余量）。 */
 export const DEFAULT_HEARTBEAT_MS = 5 * 60_000;
 
+// ─────────────────── v3：远端建会话（newSession） ───────────────────
+
+/**
+ * 默认建会话请求的存活时限：60s。
+ *
+ * 为什么和 ack 超时一样是 60s：这两件事的失败观感相同 —— 派发方发出去了，
+ * 对方没反应。60s 足够对方一轮收件箱轮询（默认注入间隔就是每轮），
+ * 又不至于让人盯着界面干等。超时后必须能说出"超时"，而不是无限 pending。
+ */
+export const DEFAULT_SESSION_REQUEST_TTL_MS = 60_000;
+
+/** 建会话请求的生命周期。与 ack_state 分开命名，避免两套语义混在一起看。 */
+export const SESSION_REQUEST_STATES = ['pending', 'claimed', 'expired'];
+
+/**
+ * 接收端拒绝建会话的原因码。
+ *
+ * 和 interconnect 的 `resume-refused` / `session-not-live` 同一套风格：
+ * **稳定的短码 + 给人看的一句话**，绝不抛裸异常。
+ * 派发方要能按码区分"对端没开开关"（该去开）和"对端建失败了"（该换参数）。
+ */
+export const SESSION_CREATE_REJECT_REASONS = {
+  'create-refused': '对端没有开启远端建会话（allowCreate=false），这是默认值',
+  'create-unsupported': '对端的 DSH 宿主没有 session/create 能力（没有 sessionController 服务）',
+  'create-failed': '对端尝试新建会话但失败了，原因见 message',
+  'create-timeout': '对端在时限内没有处理这条建会话请求（可能不在线、或没装支持该功能的版本）',
+  'instance-mismatch': '这条请求的目标实例不是本机，不该由我处理',
+};
+
+/** 一个短码是否是我们认识的拒绝原因。 */
+export function isSessionCreateRejectReason(value) {
+  return typeof value === 'string' && Object.hasOwn(SESSION_CREATE_REJECT_REASONS, value);
+}
+
 export const ACK_STATES = ['none', 'pending', 'acked', 'timeout'];
 
 /**
@@ -257,6 +291,10 @@ export function formatInboxDigest(events, opts = {}) {
     for (const t of opts.tasks) {
       lines.push(`  · ${t.task_id} 现在 ${t.lifecycle}${t.stale === 1 ? '（stale，原负责人失联）' : ''}`);
     }
+  }
+  // 噪声被过滤时要说出来：否则用户会以为"这几轮没动静"，其实是过滤掉了
+  if (typeof opts.skipped === 'number' && opts.skipped > 0) {
+    lines.push(`  （另有 ${opts.skipped} 条 peer 噪声已过滤；要看用 mesh_events）`);
   }
   lines.push('');
   lines.push('（这是自动注入，不需要你去查。要看全文用 mesh_events；游标已前移到 #' + (opts.nextSeq ?? '?') + '）');

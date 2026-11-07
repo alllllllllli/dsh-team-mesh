@@ -67,7 +67,7 @@ check('同 requestId 重放不重复建', again.includes('幂等'));
 
 headline('3. A 派给 B 实例（假 interconnect，投递成功）');
 const dispatched = await handlersA.mesh_dispatch({ taskId, instanceId: 'pc-b', sessionId: 'session-x' }, execA);
-check('投递成功并说明"投递成功≠完成"', dispatched.includes('已投递') && dispatched.includes('≠'));
+check('投递成功并说明"投递成功≠完成"', dispatched.includes('等待回执') && dispatched.includes('≠'));
 
 headline('4. A 派给一个已休眠会话（未投递，必须如实报）');
 nextResult = { delivered: false, instance: 'pc-b', reason: 'session-not-live' };

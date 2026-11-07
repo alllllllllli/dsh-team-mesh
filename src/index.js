@@ -16,6 +16,7 @@
 
 import fs from 'node:fs';
 
+import { serviceSessionRequests } from './createSession.js';
 import { createHandlers } from './handlers.js';
 import { installInboxHook } from './inboxHook.js';
 import { RemoteBoard } from './remote.js';
@@ -55,6 +56,41 @@ async function loadDefineTool() {
     if (typeof mod?.defineTool === 'function') return mod.defineTool;
   }
   throw new Error('无法解析 @deepseek-ai/dsh-tools（本地开发请设置 DSH_TOOLS_PATH 指向它的 lib/index.js）');
+}
+
+/**
+ * 造一个 `interconnect/event` 监听器：把对端事件记进审计流。
+ *
+ * 两条硬约束，都是真实事故换来的：
+ *
+ * 1. **远端板不参与写入。** 远端板上的审计事件由板服务在操作内部生成，
+ *    客户端写会被直接拒绝（`REMOTE_AUDIT_READONLY`）。
+ * 2. **rejection 必须自己接住。** `RemoteBoard.appendEvent` 是 async，
+ *    同步 try/catch 接不住它返回的 rejected promise；漏出去的未处理拒绝会被
+ *    cordis 的并行派发当成致命错误，直接打死 host 进程（`fatal load failure`）。
+ *
+ * @param {{ctx: object, board: object}} opts
+ * @returns {(notification: unknown, peer: unknown) => void}
+ */
+export function createPeerEventRecorder({ ctx, board }) {
+  const warn = (err) => {
+    try {
+      ctx?.logger?.warn?.(`[dsh-team-mesh] 记录对端事件失败：${err?.message ?? err}`);
+    } catch {
+      /* 连日志都写不了就算了，绝不能再抛 */
+    }
+  };
+  return (notification, peer) => {
+    // 远端板的审计由板服务生成，客户端不参与
+    if (board?.isRemote === true) return;
+    try {
+      Promise.resolve(
+        board.appendEvent('peer.event', null, typeof peer === 'string' ? peer : 'unknown', notification),
+      ).catch(warn);
+    } catch (err) {
+      warn(err);
+    }
+  };
 }
 
 /** 可选服务：interconnect 未启用时返回 null，而不是抛错。 */
@@ -142,28 +178,53 @@ async function registerAll(ctx, config, disposers) {
   });
   disposers.push(...tools.map((tool) => ctx.tools.register(tool)));
 
-  // 对端推来的生命周期事件：记进审计流。监听器抛错会污染链路，所以自己兜住。
-  // 注意 appendEvent 是 async：远端板按设计必然拒绝（REMOTE_AUDIT_READONLY），
-  // 同步 try/catch 接不住 rejection，漏出去会变成未处理拒绝打死 host 进程。
-  const offEvent = ctx.on('interconnect/event', (notification, peer) => {
-    const warn = (err) => {
-      try {
-        ctx?.logger?.warn?.(`[dsh-team-mesh] 记录对端事件失败：${err?.message ?? err}`);
-      } catch {
-        /* ignore */
-      }
-    };
-    // 远端板的审计由板服务在操作内部生成，客户端不参与
-    if (board.isRemote === true) return;
-    try {
-      Promise.resolve(
-        board.appendEvent('peer.event', null, typeof peer === 'string' ? peer : 'unknown', notification),
-      ).catch(warn);
-    } catch (err) {
-      warn(err);
-    }
-  });
+  // 对端推来的生命周期事件：记进审计流。详见 createPeerEventRecorder 上的两条硬约束。
+  const offEvent = ctx.on('interconnect/event', createPeerEventRecorder({ ctx, board }));
   if (typeof offEvent === 'function') disposers.push(offEvent);
+
+  // ── v3：远端建会话（newSession）的服务端一半 ──
+  // 派发方只会在板上留一条请求；**真正新建会话必须由接收端在本机执行**，
+  // 因为只有接收端有宿主注册表。这条链路能凭空开进程、还会烧对端的模型额度，
+  // 所以 allowCreate **默认 false**，和 interconnect 的 allowResume 同一套风格，
+  // 但默认值相反 —— resume 只是唤醒已有会话，create 是造一个新的。
+  const allowCreate = config.allowCreate === true;
+  let serviceCreate = null;
+  let createTimer = null;
+  if (allowCreate) {
+    const selfInstance = (() => {
+      try {
+        return interconnectOf(ctx)?.selfSender?.('__probe__')?.instanceId ?? 'unknown';
+      } catch {
+        return 'unknown';
+      }
+    })();
+    serviceCreate = () =>
+      serviceSessionRequests({
+        board,
+        ctx,
+        instanceId: selfInstance,
+        allowCreate: true,
+        limit: Number(config.createBatchLimit ?? 5),
+      });
+    // 纯空闲兜底：没有新轮次时 pre-step 不会触发，但请求仍应被处理。
+    // 周期取 3s：比 ack 窗口（60s）密得多，又不至于空转打满板。
+    const periodMs = Number(config.createPollMs ?? 3000);
+    createTimer = setInterval(() => {
+      void Promise.resolve()
+        .then(() => serviceCreate())
+        .catch((err) => {
+          try {
+            ctx?.logger?.warn?.(`[dsh-team-mesh] 建会话轮询失败：${err?.message ?? err}`);
+          } catch {
+            /* ignore */
+          }
+        });
+    }, periodMs);
+    if (typeof createTimer.unref === 'function') createTimer.unref();
+    disposers.push(() => {
+      if (createTimer !== null) clearInterval(createTimer);
+    });
+  }
 
   // ── 自动收件箱：会话下一轮把新事件摘要注入上下文 ──
   // 这是"发起方知情"的实现。对端做完活不主动发消息，我也能看到 done 事件。
@@ -175,6 +236,14 @@ async function registerAll(ctx, config, disposers) {
         ctx,
         board,
         limit: Number(config.inboxLimit ?? 20),
+        // v3：顺手服务建会话请求（没开 allowCreate 时传 null，行为与旧版一致）
+        serviceSessionRequests: serviceCreate,
+        // 默认排除 peer.event：多机同开时这类会话生命周期事件会占满注入窗口，
+        // 把真正关心的 task/evidence/gate 事件饿死在后面（实测过的真问题）。
+        // 配成 [] 表示不过滤。
+        excludeKinds: Array.isArray(config.inboxExcludeKinds)
+          ? config.inboxExcludeKinds
+          : undefined,
         resolveInstance: async (sessionId) => {
           try {
             const svc = interconnectOf(ctx);

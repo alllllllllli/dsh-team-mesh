@@ -1,7 +1,7 @@
 {
   "name": "dsh-team-mesh",
-  "version": "0.3.0-prototype",
-  "description": "Cross-instance and cross-device task mesh for DeepSeek-Harness: shared SQLite board or remote HTTP board service, interconnect dispatch with ack receipts, claim leases with heartbeat, auto-injected inbox cursor, and a completion gate that refuses model self-reports.",
+  "version": "0.3.1-prototype",
+  "description": "Cross-instance and cross-device task mesh for DeepSeek-Harness: shared SQLite board or remote HTTP board service, interconnect dispatch with ack receipts, claim leases with heartbeat, auto-injected inbox cursor with peer-noise filtering, and a completion gate that refuses model self-reports.",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -50,7 +50,8 @@
     "vendor": "node tools/vendor_deps.mjs",
     "test:v2": "node tools/e2e_v2.mjs",
     "mutation:v2": "node tools/mutation_v2.mjs",
-    "test:all": "node --test \"test/*.test.mjs\" && node tools/e2e_remote.mjs && node tools/e2e_v2.mjs"
+    "test:all": "node --test \"test/*.test.mjs\" && node tools/e2e_remote.mjs && node tools/e2e_v2.mjs",
+    "mutation:filter": "node tools/mutation_filter.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": "*"

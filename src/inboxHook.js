@@ -30,8 +30,11 @@ import { collectInbox } from './inbox.js';
  * @returns {Function|undefined} disposer
  */
 export function installInboxHook(opts) {
-  const { ctx, board, limit = 20 } = opts;
+  const { ctx, board, limit = 20, excludeKinds } = opts;
   const makeMessage = opts.makeMessage ?? defaultMakeMessage;
+  // v3：接收端的建会话服务。**可选**——没传就完全不做这件事，
+  // 于是 0.3.1 的行为一字不差。
+  const service = typeof opts.serviceSessionRequests === 'function' ? opts.serviceSessionRequests : null;
 
   const off = ctx.on(
     'agent/pre-step',
@@ -48,8 +51,40 @@ export function installInboxHook(opts) {
         if (sessionId === null) return decision;
 
         const instanceId = await opts.resolveInstance(sessionId);
-        const got = await collectInbox(board, { instanceId, sessionId, limit });
-        if (got.count === 0 || got.text === '') return decision;
+
+        // v3：顺手服务一次对端的建会话请求。
+        // 为什么放在这里而不是只靠定时器：这一侧本来就在跑，是"最可能有空"的时刻；
+        // 定时器负责在完全空闲时也把请求处理掉，两者互补。
+        // 失败绝不影响本步（建会话是别的会话的事，不关这一步的交付）。
+        if (service !== null) {
+          try {
+            await service();
+          } catch (err) {
+            try {
+              ctx?.logger?.warn?.(`[dsh-team-mesh] 处理建会话请求失败（不影响本步）：${err?.message ?? err}`);
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+
+        const got = await collectInbox(board, { instanceId, sessionId, limit, excludeKinds });
+
+        // 纯噪声的情形：不注入内容，但游标必须前进，否则噪声会永久堵住队头
+        if (got.count === 0 || got.text === '') {
+          if (got.nextSeq > got.sinceSeq) {
+            try {
+              await board.advanceCursor(instanceId, sessionId, got.nextSeq);
+            } catch (err) {
+              try {
+                ctx?.logger?.warn?.(`[dsh-team-mesh] 噪声游标前移失败：${err?.message ?? err}`);
+              } catch {
+                /* ignore */
+              }
+            }
+          }
+          return decision;
+        }
 
         // 顺序很关键：先让本步真的带上消息（返回 decision），再前移游标。
         // 如果前移失败，最坏结果是下一轮重复注入一次 —— 比"漏掉"轻。

@@ -118,12 +118,20 @@ if (!fs.existsSync(BOARD)) {
       .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
       .all()
       .map((r) => r.name);
-    const need = ['task', 'evidence', 'dispatch', 'event', 'meta'];
+    const need = ['task', 'evidence', 'dispatch', 'event', 'meta', 'ack', 'cursor'];
     const missing = need.filter((t) => !tables.includes(t));
     check('表结构齐全', missing.length === 0, missing.length === 0 ? tables.join(', ') : `缺 ${missing.join(', ')}`);
 
+    // v2：schema 升到 2（加了 ack / cursor 与 task 的租约列）
     const version = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get();
-    check('schema_version = 1', version?.value === '1', version?.value ?? '(缺)');
+    const ver = Number(version?.value ?? 0);
+    check('schema_version >= 2', ver >= 2, version?.value ?? '(缺)');
+
+    // v2 的 task 列必须真的加上（迁移成功过）
+    const taskCols = db.prepare('PRAGMA table_info(task)').all().map((c) => String(c.name));
+    const v2Cols = ['ack_state', 'ack_deadline_at', 'ack_at', 'lease_owner', 'lease_until', 'stale', 'stale_at'];
+    const missCols = v2Cols.filter((c) => !taskCols.includes(c));
+    check('v2 租约/回执列已迁移', missCols.length === 0, missCols.length === 0 ? v2Cols.join(', ') : `缺 ${missCols.join(', ')}`);
 
     // 4. 事件流：插件真的在工作才会写事件
     section('4. 事件流（插件真的在跑才会写）');

@@ -57,6 +57,41 @@ async function loadDefineTool() {
   throw new Error('无法解析 @deepseek-ai/dsh-tools（本地开发请设置 DSH_TOOLS_PATH 指向它的 lib/index.js）');
 }
 
+/**
+ * 造一个 `interconnect/event` 监听器：把对端事件记进审计流。
+ *
+ * 两条硬约束，都是真实事故换来的：
+ *
+ * 1. **远端板不参与写入。** 远端板上的审计事件由板服务在操作内部生成，
+ *    客户端写会被直接拒绝（`REMOTE_AUDIT_READONLY`）。
+ * 2. **rejection 必须自己接住。** `RemoteBoard.appendEvent` 是 async，
+ *    同步 try/catch 接不住它返回的 rejected promise；漏出去的未处理拒绝会被
+ *    cordis 的并行派发当成致命错误，直接打死 host 进程（`fatal load failure`）。
+ *
+ * @param {{ctx: object, board: object}} opts
+ * @returns {(notification: unknown, peer: unknown) => void}
+ */
+export function createPeerEventRecorder({ ctx, board }) {
+  const warn = (err) => {
+    try {
+      ctx?.logger?.warn?.(`[dsh-team-mesh] 记录对端事件失败：${err?.message ?? err}`);
+    } catch {
+      /* 连日志都写不了就算了，绝不能再抛 */
+    }
+  };
+  return (notification, peer) => {
+    // 远端板的审计由板服务生成，客户端不参与
+    if (board?.isRemote === true) return;
+    try {
+      Promise.resolve(
+        board.appendEvent('peer.event', null, typeof peer === 'string' ? peer : 'unknown', notification),
+      ).catch(warn);
+    } catch (err) {
+      warn(err);
+    }
+  };
+}
+
 /** 可选服务：interconnect 未启用时返回 null，而不是抛错。 */
 function interconnectOf(ctx) {
   try {
@@ -142,18 +177,8 @@ async function registerAll(ctx, config, disposers) {
   });
   disposers.push(...tools.map((tool) => ctx.tools.register(tool)));
 
-  // 对端推来的生命周期事件：记进审计流。监听器抛错会污染链路，所以自己兜住。
-  const offEvent = ctx.on('interconnect/event', (notification, peer) => {
-    try {
-      board.appendEvent('peer.event', null, typeof peer === 'string' ? peer : 'unknown', notification);
-    } catch (err) {
-      try {
-        ctx?.logger?.warn?.(`[dsh-team-mesh] 记录对端事件失败：${err?.message ?? err}`);
-      } catch {
-        /* ignore */
-      }
-    }
-  });
+  // 对端推来的生命周期事件：记进审计流。详见 createPeerEventRecorder 上的两条硬约束。
+  const offEvent = ctx.on('interconnect/event', createPeerEventRecorder({ ctx, board }));
   if (typeof offEvent === 'function') disposers.push(offEvent);
 
   // ── 自动收件箱：会话下一轮把新事件摘要注入上下文 ──
@@ -166,6 +191,12 @@ async function registerAll(ctx, config, disposers) {
         ctx,
         board,
         limit: Number(config.inboxLimit ?? 20),
+        // 默认排除 peer.event：多机同开时这类会话生命周期事件会占满注入窗口，
+        // 把真正关心的 task/evidence/gate 事件饿死在后面（实测过的真问题）。
+        // 配成 [] 表示不过滤。
+        excludeKinds: Array.isArray(config.inboxExcludeKinds)
+          ? config.inboxExcludeKinds
+          : undefined,
         resolveInstance: async (sessionId) => {
           try {
             const svc = interconnectOf(ctx);

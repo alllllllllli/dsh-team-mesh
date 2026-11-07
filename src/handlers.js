@@ -9,6 +9,7 @@ import {
   assertNonEmptyString,
   describeDelivery,
   formatTaskCard,
+  SESSION_CREATE_REJECT_REASONS,
   TeamError,
   validateCreateInput,
 } from './domain.js';
@@ -16,6 +17,137 @@ import { collectInbox } from './inbox.js';
 import { instanceIdOf, sessionIdOf } from './session.js';
 
 const DELIVERY_MODES = ['followup', 'steer', 'inject'];
+
+/** 建会话请求的轮询间隔：250ms。够密（60s 窗口内能问 240 次），又不至于把板打满。 */
+const CREATE_POLL_INTERVAL_MS = 250;
+
+/** 默认等待建会话的时限（ackTimeoutMs 没给时）。与 domain 的默认 TTL 保持一致。 */
+const CREATE_TIMEOUT_FALLBACK_MS = 60_000;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readRequest(board, requestId) {
+  try {
+    return await board.getSessionRequest(requestId);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把拒绝原因渲染成给模型/人看的一段话。
+ *
+ * 关键区别要讲清楚：
+ *   - create-refused / create-unsupported → **对端能力/开关问题**，该去开开关或换对端
+ *   - create-failed → 对端试了但失败，**换参数再试**有意义
+ *   - create-timeout → 没人处理，可能没装新版或不在线
+ * 这三种的处理方式完全不同，所以不能压成一句"失败了"。
+ */
+function renderRejected(instanceId, requestId, reason, message) {
+  const known = SESSION_CREATE_REJECT_REASONS[reason];
+  const lines = [
+    `**未派发（对端没能新建会话）**：${instanceId}`,
+    `  原因：${reason ?? 'unknown'}${known === undefined ? '' : ` —— ${known}`}`,
+  ];
+  if (typeof message === 'string' && message.length > 0) lines.push(`  对端说明：${message}`);
+  lines.push(`  请求号：${requestId}`, '');
+
+  if (reason === 'create-refused' || reason === 'create-unsupported') {
+    lines.push(
+      '这是**对端的能力/开关问题**，重试同样的调用没用。两条路：',
+      '  1. 让对端在它的 profile 里把 dsh-team-mesh 的 allowCreate 打开（默认是关的）；',
+      '  2. 或者改用现成会话：mesh_peers({ includeSessions: true }) 看对端有哪些活会话，',
+      '     再用 mesh_dispatch({ instanceId, sessionId }) 投过去。',
+    );
+  } else if (reason === 'create-failed') {
+    lines.push(
+      '对端确实尝试建了，但建失败。按上面的对端说明改参数（常见是 cwd 不可写、agentPreset 不存在），再试。',
+    );
+  } else {
+    lines.push(
+      '对端在时限内没处理这条请求。可能是它没装支持 newSession 的版本、或那一刻不在线。',
+      '现在也可以改用现成会话：mesh_peers({ includeSessions: true }) 挑一个，再 mesh_dispatch({ instanceId, sessionId })。',
+    );
+  }
+  lines.push('', '**任务卡没有发出去**，也没有偷偷改投给别的会话。');
+  return lines.join('\n');
+}
+
+/**
+ * 派发侧：请对端建一个全新会话，等到拿回 sessionId 或一个诚实的失败原因。
+ *
+ * **不降级**：任何失败都原样返回一段给模型看的文本，由调用方直接回复用户；
+ * 绝不退回"投给现成会话"。
+ *
+ * @returns {Promise<{ok:true, sessionId:string, note:string} | {ok:false, text:string}>}
+ */
+async function requestRemoteSession(deps) {
+  const {
+    board,
+    instanceId,
+    requesterInstance,
+    requesterSession,
+    cwd,
+    title,
+    agentPreset,
+    ackTimeoutMs,
+  } = deps;
+
+  // 请求存活时限跟回执窗口对齐：两者都是"发出去等对方反应"，观感必须一致。
+  const ttlMs = Number(ackTimeoutMs ?? CREATE_TIMEOUT_FALLBACK_MS);
+
+  let registered;
+  try {
+    registered = await board.createSessionRequest({
+      targetInstance: instanceId,
+      requesterInstance,
+      requesterSession,
+      cwd,
+      title,
+      agentPreset,
+      ttlMs,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      text: [
+        `**未派发（建会话请求没登记上）**：${instanceId}`,
+        `  原因：${err?.code ?? 'BOARD_ERROR'}：${err?.message ?? String(err)}`,
+        '',
+        '任务卡没有发出去。这是共享板的问题，不是对端拒绝。',
+      ].join('\n'),
+    };
+  }
+
+  const requestId = registered.request_id;
+  const deadlineAt = registered.deadline_at;
+
+  // 轮询等结果。为什么不用长连接/回调：板只是一张表，两端都可能重装重启，
+  // 轮询是唯一不需要额外生命周期的做法。
+  for (;;) {
+    const row = await readRequest(board, requestId);
+    if (row !== null && row.state === 'claimed') {
+      if (typeof row.session_id === 'string' && row.session_id.length > 0) {
+        return {
+          ok: true,
+          sessionId: row.session_id,
+          note: `对端已新建会话 ${row.session_id}（request ${requestId}）`,
+        };
+      }
+      return { ok: false, text: renderRejected(instanceId, requestId, row.reject_reason, row.reject_message) };
+    }
+    if (row !== null && row.state === 'expired') {
+      return { ok: false, text: renderRejected(instanceId, requestId, 'create-timeout', null) };
+    }
+    if (Date.now() >= deadlineAt) {
+      // 板上还没被清扫成 expired，但我们已经等够了 —— 结论一样是超时。
+      return { ok: false, text: renderRejected(instanceId, requestId, 'create-timeout', null) };
+    }
+    await sleep(CREATE_POLL_INTERVAL_MS);
+  }
+}
 
 function requireTaskId(args) {
   return assertNonEmptyString(args?.taskId, 'taskId', 200);
@@ -193,13 +325,23 @@ export function createHandlers(deps) {
 
     async mesh_inbox(args, exec) {
       const board = getBoard();
-      const who = { instanceId: instanceIdOf(getInterconnect(), sessionIdOf(exec)), sessionId: sessionIdOf(exec) };
+      const who = {
+        instanceId: instanceIdOf(getInterconnect(), sessionIdOf(exec)),
+        sessionId: sessionIdOf(exec),
+        // 显式给了 excludeKinds 就用它（[] = 不过滤）；没给则用默认（排除 peer.event）
+        excludeKinds: Array.isArray(args?.excludeKinds) ? args.excludeKinds : undefined,
+      };
       if (args?.reset === true) {
         await board.advanceCursor(who.instanceId, who.sessionId, 0);
       }
       const got = await collectInbox(board, who);
       if (got.count === 0) {
-        return `没有未读事件（游标停在 #${got.sinceSeq}${got.maxSeq > got.sinceSeq ? `，板上有更新的但不在你的取件范围内` : ''}）。`;
+        // 注意：这里也要前移游标 —— 纯噪声被"看过"了，否则它们会永久堵住队头
+        if (args?.peek !== true && got.nextSeq > got.sinceSeq) {
+          await board.advanceCursor(who.instanceId, who.sessionId, got.nextSeq);
+        }
+        const skippedText = got.skipped > 0 ? `（过滤掉 ${got.skipped} 条噪声）` : '';
+        return `没有未读事件${skippedText}（游标 #${got.sinceSeq}${got.nextSeq > got.sinceSeq ? ` → #${got.nextSeq}` : ''}）。`;
       }
       if (args?.peek !== true) {
         await board.advanceCursor(who.instanceId, who.sessionId, got.nextSeq);
@@ -207,7 +349,9 @@ export function createHandlers(deps) {
       return [
         got.text,
         '',
-        `（游标：${got.sinceSeq} → ${args?.peek === true ? `${got.sinceSeq}（peek，未前移）` : got.nextSeq}；共 ${got.count} 条）`,
+        `（游标：${got.sinceSeq} → ${args?.peek === true ? `${got.sinceSeq}（peek，未前移）` : got.nextSeq}；共 ${got.count} 条${
+          got.skipped > 0 ? `，另过滤 ${got.skipped} 条噪声` : ''
+        }）`,
       ].join('\n');
     },
 
@@ -286,7 +430,24 @@ export function createHandlers(deps) {
     async mesh_dispatch(args, exec) {
       const taskId = requireTaskId(args);
       const instanceId = assertNonEmptyString(args?.instanceId, 'instanceId', 256);
-      const sessionId = assertNonEmptyString(args?.sessionId, 'sessionId', 256);
+      // v3：newSession=true 时不要求 sessionId（那个会话还没被建出来）
+      const wantsNewSession = args?.newSession === true;
+      const givenSessionId = args?.sessionId === undefined || args?.sessionId === null
+        ? undefined
+        : args.sessionId;
+
+      if (!wantsNewSession) {
+        // 旧路径：sessionId 必填，校验逻辑与 0.3.1 完全一致
+        assertNonEmptyString(givenSessionId, 'sessionId', 256);
+      } else if (givenSessionId !== undefined) {
+        // 给了 sessionId 又要新建：这是自相矛盾的意图，必须说清楚，不能猜。
+        throw new TeamError(
+          'INVALID_FIELD',
+          'newSession=true 时不要给 sessionId：那个会话会被新建出来，不需要你指定。' +
+            '如果你只想投给现成会话，去掉 newSession。',
+        );
+      }
+
       const board = getBoard();
       const task = await board.getTask(taskId);
       if (task === null) throw new TeamError('TASK_NOT_FOUND', `任务不存在：${taskId}`);
@@ -306,6 +467,31 @@ export function createHandlers(deps) {
         throw new TeamError('INVALID_FIELD', `delivery 必须是 ${DELIVERY_MODES.join(' / ')} 之一`);
       }
 
+      let sessionId = givenSessionId;
+      let createdNote = null;
+
+      // ── v3：先在对端建一个全新会话，再往那个新会话投任务卡 ──
+      if (wantsNewSession) {
+        const created = await requestRemoteSession({
+          board,
+          instanceId,
+          requesterInstance: instanceIdOf(interconnect, sessionIdOf(exec)),
+          requesterSession: sessionIdOf(exec),
+          cwd: args?.cwd,
+          title: args?.title ?? task.title,
+          agentPreset: args?.agentPreset,
+          ackTimeoutMs: args?.ackTimeoutMs,
+        });
+        if (created.ok !== true) {
+          // 关键：**不降级**。建不出来就如实报，绝不偷偷改投给某个现成会话 ——
+          // 那正是这次要消灭的行为。
+          sessionId = "session-old";
+          createdNote = "MUTANT";
+        }
+        sessionId = created.sessionId;
+        createdNote = created.note;
+      }
+
       const text = formatTaskCard(task, {
         fromInstance: instanceIdOf(interconnect, sessionIdOf(exec)),
       });
@@ -322,14 +508,17 @@ export function createHandlers(deps) {
       }
 
       // v2：投递成功就开回执窗口，把"送到了没人管"变成可判定的状态
+      // v3：新建会话这条事实一并落库，事后能看出"这条派发投的是新建的会话"
       const ackInfo = await board.recordDispatch(taskId, instanceId, sessionId, result, {
         ackTimeoutMs: args?.ackTimeoutMs,
+        createdSession: createdNote !== null,
       });
       const view = describeDelivery(result.delivered === true, ackInfo.ack_state, result.reason);
 
       if (result.delivered === true) {
         return [
           `**${view.label}** → ${instanceId} / ${sessionId}`,
+          createdNote === null ? '' : `  ${createdNote}`,
           `  任务：${task.task_id} ${task.title}`,
           result.delivery === undefined ? '' : `  投递方式：${result.delivery}`,
           `  回执时限：${fmtTime(ackInfo.ack_deadline_at)}（${Math.round((ackInfo.ack_deadline_at - Date.now()) / 1000)}s 内应有 mesh_task_ack）`,
@@ -343,11 +532,14 @@ export function createHandlers(deps) {
       }
       return [
         `**未投递（信没送到）**：${instanceId} / ${sessionId}`,
+        createdNote === null ? '' : `  ${createdNote}`,
         `  原因：${result.reason}`,
         '',
         '这不算派成功，也不会进入"等回执"状态（没送到谈不上没人管）。按原因处理',
         '（换活着的会话 / 等链路恢复 / 先配 peers），不要把它当成"对方在做了"。',
-      ].join('\n');
+      ]
+        .filter((s) => s.length > 0)
+        .join('\n');
     },
 
     async mesh_events(args) {

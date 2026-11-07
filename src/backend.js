@@ -22,7 +22,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { eventPayload } from './domain.js';
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS dispatch (
   peer_session  TEXT NOT NULL,
   delivered     INTEGER NOT NULL CHECK (delivered IN (0,1)),
   reason        TEXT,
+  created_session INTEGER NOT NULL DEFAULT 0,
   created_at    INTEGER NOT NULL
 );
 
@@ -124,6 +125,45 @@ CREATE TABLE IF NOT EXISTS cursor (
   updated_at  INTEGER NOT NULL,
   PRIMARY KEY (instance_id, session_id)
 );
+
+-- ── v3：远端建会话请求（newSession） ─────────────────────────────────────
+-- 病根：interconnect 只有 list/send，没有 create，于是派发方只能挑现成会话；
+-- 对端只有一个活会话时，所有任务全堵进那一个（2026-11-08 凌晨实测 4 次全 ACK_TIMEOUT）。
+--
+-- 解法不用改 interconnect 协议：借**共享板**当信箱。
+--   派发方 createSessionRequest() 写一行 pending → 对端 team-mesh 的收件箱轮询看到
+--   → 它在本机调 Host 的 sessionController.create() **真正新建会话**
+--   → 再 claimSessionRequest() 把结果写回（sessionId 或拒绝原因）
+--   → 派发方 waitSessionRequest() 读到结果，拿新 sessionId 做正常的 interconnect.send。
+--
+-- 为什么在板上而不是在 interconnect 帧里：板本来就是两端都能读写的共享介质，
+-- 而且 boardToken 已经鉴权。改帧要全集群升同一版插件，改板不用。
+CREATE TABLE IF NOT EXISTS session_request (
+  request_id    TEXT PRIMARY KEY,
+  -- 谁请求的：用于对端判断"这条是不是给我的"
+  target_instance TEXT NOT NULL,
+  requester_instance TEXT NOT NULL,
+  requester_session  TEXT,
+  -- 想要什么（全部可空，由接收端补默认值）
+  cwd           TEXT,
+  title         TEXT,
+  agent_preset  TEXT,
+  prompt        TEXT,
+  -- 生命周期：pending → claimed(已建/已拒) ；expired 由清扫写
+  state         TEXT NOT NULL DEFAULT 'pending'
+                CHECK (state IN ('pending','claimed','expired')),
+  -- 结果：成功给 session_id，失败给 reject_reason + reject_message
+  session_id    TEXT,
+  reject_reason TEXT,
+  reject_message TEXT,
+  claimed_by    TEXT,
+  created_at    INTEGER NOT NULL,
+  claimed_at    INTEGER,
+  deadline_at   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_request_target
+  ON session_request(target_instance, state, created_at);
 `;
 
 /** v2 给 task 表追加的列（SQLite 的 ADD COLUMN 是幂等的按需执行，不能写在 DDL 里重复） */
@@ -152,6 +192,7 @@ export class LocalSqliteBackend {
     // v1 → v2 迁移：给已有 task 表补列。SQLite 没有 ADD COLUMN IF NOT EXISTS，
     // 所以按 PRAGMA table_info 逐个判断，可反复执行（幂等）。
     this.migrateTaskV2();
+    this.migrateDispatchV3();
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
     if (row === undefined) {
       this.db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
@@ -167,6 +208,20 @@ export class LocalSqliteBackend {
     for (const [name, decl] of TASK_V2_COLUMNS) {
       if (existing.has(name)) continue;
       this.db.exec(`ALTER TABLE task ADD COLUMN ${name} ${decl}`);
+    }
+  }
+
+  /**
+   * v3 迁移：给老的 dispatch 表补 created_session 列。
+   * 老库（0.3.1 建的）里这张表没有这列，不补 INSERT 会直接报 no such column。
+   * 默认 0 = "现成会话"，正好是老行为的正确表述。
+   */
+  migrateDispatchV3() {
+    const existing = new Set(
+      this.db.prepare('PRAGMA table_info(dispatch)').all().map((c) => String(c.name)),
+    );
+    if (!existing.has('created_session')) {
+      this.db.exec('ALTER TABLE dispatch ADD COLUMN created_session INTEGER NOT NULL DEFAULT 0');
     }
   }
 
@@ -276,10 +331,18 @@ export class LocalSqliteBackend {
   insertDispatch(row) {
     const info = this.db
       .prepare(
-        `INSERT INTO dispatch(task_id, peer_instance, peer_session, delivered, reason, created_at)
-         VALUES (?,?,?,?,?,?)`,
+        `INSERT INTO dispatch(task_id, peer_instance, peer_session, delivered, reason, created_session, created_at)
+         VALUES (?,?,?,?,?,?,?)`,
       )
-      .run(row.task_id, row.peer_instance, row.peer_session, row.delivered ? 1 : 0, row.reason, row.created_at);
+      .run(
+        row.task_id,
+        row.peer_instance,
+        row.peer_session,
+        row.delivered ? 1 : 0,
+        row.reason,
+        row.created_session ?? 0,
+        row.created_at,
+      );
     return Number(info.lastInsertRowid);
   }
 
@@ -297,6 +360,77 @@ export class LocalSqliteBackend {
     return taskId === null
       ? this.db.prepare(sql).all(limit)
       : this.db.prepare(sql).all(taskId, limit);
+  }
+
+  // ─────────────────── v3：远端建会话请求（板当信箱） ───────────────────
+
+  insertSessionRequest(row) {
+    this.db
+      .prepare(
+        `INSERT INTO session_request(request_id, target_instance, requester_instance, requester_session,
+           cwd, title, agent_preset, prompt, state, created_at, deadline_at)
+         VALUES (?,?,?,?,?,?,?,?,'pending',?,?)`,
+      )
+      .run(
+        row.request_id,
+        row.target_instance,
+        row.requester_instance,
+        row.requester_session ?? null,
+        row.cwd ?? null,
+        row.title ?? null,
+        row.agent_preset ?? null,
+        row.prompt ?? null,
+        row.created_at,
+        row.deadline_at,
+      );
+    return row.request_id;
+  }
+
+  readSessionRequest(requestId) {
+    return this.db.prepare('SELECT * FROM session_request WHERE request_id = ?').get(requestId);
+  }
+
+  /** 取该实例名下待处理的请求，**最旧优先**（先来先建，避免新请求饿死老的）。 */
+  queryPendingSessionRequests(targetInstance, limit) {
+    return this.db
+      .prepare(
+        `SELECT * FROM session_request
+          WHERE target_instance = ? AND state = 'pending'
+          ORDER BY created_at ASC LIMIT ?`,
+      )
+      .all(targetInstance, limit);
+  }
+
+  /**
+   * 抢占一条 pending 请求并写结果（一个事务内完成）。
+   * 用 state='pending' 做 CAS：两个进程同时扫到同一条，只有一个能写进去。
+   * @returns 是否由本次调用接管（false 表示已被别人处理或已过期）
+   */
+  claimSessionRequest(requestId, row) {
+    const info = this.db
+      .prepare(
+        `UPDATE session_request
+            SET state = 'claimed', claimed_by = ?, claimed_at = ?,
+                session_id = ?, reject_reason = ?, reject_message = ?
+          WHERE request_id = ? AND state = 'pending'`,
+      )
+      .run(
+        row.claimed_by ?? null,
+        row.claimed_at,
+        row.session_id ?? null,
+        row.reject_reason ?? null,
+        row.reject_message ?? null,
+        requestId,
+      );
+    return Number(info.changes) > 0;
+  }
+
+  /** 把超过 deadline 还 pending 的请求标成 expired。返回被标了几条。 */
+  expireSessionRequests(now) {
+    const info = this.db
+      .prepare(`UPDATE session_request SET state = 'expired' WHERE state = 'pending' AND deadline_at <= ?`)
+      .run(now);
+    return Number(info.changes);
   }
 
   // ───────────────────── 内容寻址对象（跨机证据用） ─────────────────────

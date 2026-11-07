@@ -17,6 +17,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 import {
   assertNonEmptyString,
@@ -25,6 +26,7 @@ import {
   decideAdmissibility,
   DEFAULT_ACK_TIMEOUT_MS,
   DEFAULT_LEASE_MS,
+  DEFAULT_SESSION_REQUEST_TTL_MS,
   evaluateCompletion,
   leaseIsLive,
   OUTCOMES,
@@ -446,6 +448,9 @@ export class Board {
         delivered,
         reason: result.reason ?? null,
         created_at: now,
+        // v3：这条派发投的是"本次新建的会话"还是"现成会话"。
+        // 不记下来的话，事后看审计会分不清"任务堵在老会话"和"给新会话派的活"。
+        created_session: opts?.createdSession === true ? 1 : 0,
       });
 
       let ackId = null;
@@ -483,6 +488,8 @@ export class Board {
         reason: result.reason ?? null,
         ack_state: ackState,
         ack_deadline_at: delivered ? now + ackTimeoutMs : null,
+        // v3：审计里能直接看出"这是新建的会话"
+        created_session: opts?.createdSession === true,
       });
       return { dispatch_id: dispatchId, ack_id: ackId, ack_state: ackState, ack_deadline_at: delivered ? now + ackTimeoutMs : null };
     });
@@ -568,7 +575,8 @@ export class Board {
   sweepAll(now = Date.now()) {
     const ack = this.sweepAckTimeouts(now);
     const lease = this.sweepStaleLeases(now);
-    return { ack, lease };
+    const sessionRequest = this.sweepSessionRequests(now);
+    return { ack, lease, session_request: sessionRequest };
   }
 
   // ───────────────────── v2：收件箱游标 ─────────────────────
@@ -580,9 +588,16 @@ export class Board {
   /**
    * 取"此游标之后的新事件"，并**不自动前移** —— 前移由调用方在确认注入后调用
    * `advanceCursor`。分成两步是为了：注入失败/被跳过时游标不动，下一轮还能补上。
+   *
+   * @param {string} instanceId
+   * @param {string} sessionId
+   * @param {number} limit
+   * @param {number} [sinceSeq] 覆盖游标起点（收件箱翻页用；不传则用存储的游标）
    */
-  pendingEvents(instanceId, sessionId, limit = 20) {
-    const since = this.backend.getCursor(instanceId, sessionId);
+  pendingEvents(instanceId, sessionId, limit = 20, sinceSeq) {
+    const since = sinceSeq === undefined || sinceSeq === null
+      ? this.backend.getCursor(instanceId, sessionId)
+      : Number(sinceSeq);
     const events = this.backend.queryEventsAfter(since, limit);
     const maxSeq = this.backend.maxEventSeq();
     return { since_seq: since, events, max_seq: maxSeq };
@@ -597,6 +612,80 @@ export class Board {
     const n = Math.min(Math.max(Number(limit), 1), 100);
     const rows = this.backend.queryEvents(n, taskId);
     return rows.map((r) => ({ ...r, payload: safeParse(r.payload) }));
+  }
+
+  // ──────────────── v3：远端建会话请求（板当信箱） ────────────────
+
+  /**
+   * 登记一条"请对端帮我开个新会话"的请求。
+   *
+   * 为什么要有 deadline：对端可能没装新版、可能没开 allowCreate、可能根本不在线。
+   * 没有 deadline 的话派发方只能一直等，表现为"卡住"；有了它就能如实说"超时没人处理"。
+   */
+  createSessionRequest(input) {
+    const targetInstance = assertNonEmptyString(input.targetInstance, 'targetInstance', 256);
+    const requesterInstance = assertNonEmptyString(input.requesterInstance, 'requesterInstance', 256);
+    const now = Date.now();
+    const ttlMs = Number(input.ttlMs ?? DEFAULT_SESSION_REQUEST_TTL_MS);
+    const requestId = `sr-${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+    return this.tx(() => {
+      this.backend.insertSessionRequest({
+        request_id: requestId,
+        target_instance: targetInstance,
+        requester_instance: requesterInstance,
+        requester_session: input.requesterSession ?? null,
+        cwd: input.cwd ?? null,
+        title: input.title ?? null,
+        agent_preset: input.agentPreset ?? null,
+        prompt: input.prompt ?? null,
+        created_at: now,
+        deadline_at: now + ttlMs,
+      });
+      this.appendEvent('session.requested', null, input.requesterSession ?? null, {
+        request_id: requestId,
+        target_instance: targetInstance,
+        title: input.title ?? null,
+      });
+      return { request_id: requestId, deadline_at: now + ttlMs };
+    });
+  }
+
+  getSessionRequest(requestId) {
+    return this.backend.readSessionRequest(requestId);
+  }
+
+  /** 对端取自己名下待处理的建会话请求。 */
+  pendingSessionRequests(targetInstance, limit = 5) {
+    return this.backend.queryPendingSessionRequests(targetInstance, Math.min(Math.max(Number(limit), 1), 20));
+  }
+
+  /**
+   * 认领并写结果。**结果必须如实写**：建成功写 session_id，失败写 reject_reason。
+   * 不允许"建失败但什么都不写"——那会让派发方等到超时，把明确失败说成"没人管"。
+   */
+  claimSessionRequest(requestId, result) {
+    const now = Date.now();
+    return this.tx(() => {
+      const ok = this.backend.claimSessionRequest(requestId, {
+        claimed_by: result.claimedBy ?? null,
+        claimed_at: now,
+        session_id: result.sessionId ?? null,
+        reject_reason: result.rejectReason ?? null,
+        reject_message: result.rejectMessage ?? null,
+      });
+      if (!ok) return { claimed: false };
+      this.appendEvent('session.created', null, result.claimedBy ?? null, {
+        request_id: requestId,
+        session_id: result.sessionId ?? null,
+        reject_reason: result.rejectReason ?? null,
+      });
+      return { claimed: true, request: this.backend.readSessionRequest(requestId) };
+    });
+  }
+
+  /** 扫超时请求。和 ack/租约清扫一起在收件箱注入前调用。 */
+  sweepSessionRequests(now = Date.now()) {
+    return this.backend.expireSessionRequests(now);
   }
 
   rowToTask(row) {

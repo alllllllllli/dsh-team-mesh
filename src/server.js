@@ -201,6 +201,8 @@ function makeRoutes(board) {
         String(params.instanceId ?? 'unknown'),
         String(params.sessionId ?? 'unknown'),
         params.limit === undefined ? 20 : Number(params.limit),
+        // 收件箱翻页时用 since 覆盖游标起点；不传则按存储游标
+        params.since === undefined || params.since === '' ? undefined : Number(params.since),
       );
       return { ok: true, ...res };
     },
@@ -220,8 +222,48 @@ function makeRoutes(board) {
     },
 
     'POST /dispatch/record': (_ctx, _p, body) => {
-      const id = board.recordDispatch(body.taskId, body.peerInstance, body.peerSession, body.result ?? {});
-      return { ok: true, dispatch_id: id };
+      const res = board.recordDispatch(body.taskId, body.peerInstance, body.peerSession, body.result ?? {}, {
+        ackTimeoutMs: body.ackTimeoutMs,
+        createdSession: body.createdSession === true,
+      });
+      // 必须把 ack 字段原样带回来：远端板模式下 handlers 靠 ack_state / ack_deadline_at
+      // 决定显示"等待回执 / 送到了没人管"，少带一个就会显示 undefined / NaN。
+      return { ok: true, ...res };
+    },
+
+    // ── v3：远端建会话请求（板当信箱） ──
+    'POST /session-request/create': (_ctx, _p, body) => {
+      const res = board.createSessionRequest({
+        targetInstance: body.targetInstance,
+        requesterInstance: body.requesterInstance,
+        requesterSession: body.requesterSession,
+        cwd: body.cwd,
+        title: body.title,
+        agentPreset: body.agentPreset,
+        prompt: body.prompt,
+        ttlMs: body.ttlMs,
+      });
+      return { ok: true, ...res };
+    },
+
+    'GET /session-request/get': (_ctx, params) => ({
+      ok: true,
+      request: board.getSessionRequest(String(params.requestId ?? '')),
+    }),
+
+    'GET /session-request/pending': (_ctx, params) => ({
+      ok: true,
+      requests: board.pendingSessionRequests(String(params.targetInstance ?? ''), params.limit === undefined ? 5 : Number(params.limit)),
+    }),
+
+    'POST /session-request/claim': (_ctx, _p, body) => {
+      const res = board.claimSessionRequest(body.requestId, {
+        claimedBy: body.claimedBy,
+        sessionId: body.sessionId,
+        rejectReason: body.rejectReason,
+        rejectMessage: body.rejectMessage,
+      });
+      return { ok: true, ...res };
     },
 
     'GET /events': (_ctx, params) => ({

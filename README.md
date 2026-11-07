@@ -97,6 +97,38 @@
 
 `config.inbox === false` 可关闭自动注入（排障用）。
 
+### 噪声过滤：`inboxExcludeKinds`
+
+多台机器同时开着时，`peer.event`（别处会话的 created / disposed / running 状态）会
+**占满注入窗口**，把真正关心的 `task.*` / `evidence.*` / `gate_rejected` 挤到 20 条之后——
+实测过：真实任务事件要过两轮才浮上来。
+
+```yaml
+- id: dsh-team-mesh
+  config:
+    inboxExcludeKinds: ['peer.event']   # 默认值；传 [] 表示不过滤
+    inboxLimit: 20
+```
+
+实现上有两个**必须同时成立**的点，缺一个就会退化成"饿死"：
+
+1. **取更多、过滤后再截断**：单轮取 `limit × 5`，需要时继续向后翻页，
+   保证噪声再多也能捞到真事件。
+2. **被过滤的事件也算"看过"，游标必须越过它们**：否则噪声永久堵在队头，
+   后面的事件永远读不到。
+
+游标前移规则（这是正确性核心）：
+
+| 情况 | 游标前移到 |
+| --- | --- |
+| 过滤后剩余 ≤ `limit` | 本轮**全部取出**的最后一条（噪声一并越过） |
+| 过滤后剩余 > `limit` | 本轮**实际显示**的最后一条（未显示的真实事件绝不越过） |
+| 过滤后一条不剩 | 本轮取出的最后一条（不注入内容，但游标必须前进） |
+
+摘要里会写明 `（另有 N 条 peer 噪声已过滤；要看用 mesh_events）`，
+所以"没动静"和"有噪声被滤掉"不会混为一谈。
+
+
 
 ## 四条不变量（这是这个插件真正的价值）
 
@@ -155,16 +187,34 @@ dsh plugin --profile desktop remove dsh-team-mesh
 ## 验证过什么（2026-11-07 本机实测）
 
 ```
-node --test "test/*.test.mjs"      → 61 tests / 61 pass / 0 fail      （v1 39 + v2 22）
+node --test "test/*.test.mjs"      → 77 tests / 77 pass / 0 fail      （v1 39 + v2 22 + v3 16）
 node tools/e2e_remote.mjs          → 24 项跨机，0 失败                （A/B/C/D 四组）
 node tools/e2e_v2.mjs              → 29 项 v2，0 失败                 （a/b/c/d + d2 + 门禁）
 node tools/mutation_remote.mjs     → 6 个跨机变异全被抓，drift=0
 node tools/mutation_v2.mjs         → 7 个 v2 变异全被抓，drift=0
+node tools/mutation_filter.mjs     → 6 个噪声过滤变异全被抓，drift=0
 node tools/mutation.mjs            → 5 个单机变异全被抓，drift=0
 node tools/smoke.mjs               → 13 项端到端，0 失败
-node tools/verify.mjs              → 16 项验收（源/装哈希一致等）
+node tools/verify.mjs              → 17 项验收（源/装哈希一致、v2 列已迁移等）
 node tools/client_cli.mjs health   → 板服务可达
 ```
+
+### v3 噪声过滤（`test/inbox_filter.test.mjs`，16 项 + 6 个变异）
+
+| 组 | 验什么 |
+| --- | --- |
+| **a** | 全是 `peer.event` 的两轮：不注入内容，但游标前进；下一轮真实事件能浮出 |
+| **b** | `peer.event` 夹在中间：后面的 task 事件下一轮就浮出，**不被饿死**（逐轮推进验证 10 条真实事件全读到） |
+| **c** | `excludeKinds: []` → 不过滤，行为与改动前一致；自定义种类只排它 |
+| **d** | 走真实 `agent/pre-step` 钩子：纯噪声不产生注入消息 |
+| **e** | 摘要如实写明过滤掉多少条 |
+
+变异测试 F1~F6 覆盖：纯噪声不前移、游标跳到全表最大、不按 kind 过滤、
+不放大采集窗口、钩子路径不前移、忽略 `excludeKinds` 配置。
+**F2（游标跳全表最大）第一次没被抓到** —— 因为我的 b2 断言太宽松，第二轮只要
+"还能注入"就算过，而实际上注入的可能是重复的旧事件。改成"必须读到全部 10 条真实事件"
+后才抓到。这条记在下面。
+
 
 ### v2 的四项验收（`tools/e2e_v2.mjs`，29 项）
 

@@ -258,11 +258,54 @@ export class RemoteBoard {
     return { task: r.task };
   }
 
-  async recordDispatch(taskId, peerInstance, peerSession, result) {
+  async recordDispatch(taskId, peerInstance, peerSession, result, opts = {}) {
     const r = await this.call('POST', '/dispatch/record', {
-      body: { taskId, peerInstance, peerSession, result },
+      body: {
+        taskId,
+        peerInstance,
+        peerSession,
+        result,
+        ackTimeoutMs: opts?.ackTimeoutMs,
+        createdSession: opts?.createdSession === true,
+      },
     });
-    return r.dispatch_id;
+    return { dispatch_id: r.dispatch_id, ack_id: r.ack_id, ack_state: r.ack_state, ack_deadline_at: r.ack_deadline_at };
+  }
+
+  // ──────────────── v3：远端建会话请求（板当信箱） ────────────────
+
+  async createSessionRequest(input) {
+    const r = await this.call('POST', '/session-request/create', { body: { ...input } });
+    return { request_id: r.request_id, deadline_at: Number(r.deadline_at) };
+  }
+
+  async getSessionRequest(requestId) {
+    try {
+      const r = await this.call('GET', '/session-request/get', { query: { requestId } });
+      return r.request ?? null;
+    } catch (err) {
+      // 不存在的请求号不是错误，是"还没有" —— 轮询路径靠这个区分
+      if (err instanceof TeamError && (err.code === 'TASK_NOT_FOUND' || err.code === 'NOT_FOUND')) return null;
+      throw err;
+    }
+  }
+
+  async pendingSessionRequests(targetInstance, limit = 5) {
+    const r = await this.call('GET', '/session-request/pending', { query: { targetInstance, limit } });
+    return r.requests ?? [];
+  }
+
+  async claimSessionRequest(requestId, result) {
+    const r = await this.call('POST', '/session-request/claim', {
+      body: {
+        requestId,
+        claimedBy: result?.claimedBy,
+        sessionId: result?.sessionId,
+        rejectReason: result?.rejectReason,
+        rejectMessage: result?.rejectMessage,
+      },
+    });
+    return { claimed: r.claimed === true, request: r.request ?? null };
   }
 
   async recentEvents(limit = 20, taskId = null) {
@@ -295,8 +338,10 @@ export class RemoteBoard {
     return { ack: r.ack, lease: r.lease };
   }
 
-  async pendingEvents(instanceId, sessionId, limit = 20) {
-    const r = await this.call('GET', '/inbox/pending', { query: { instanceId, sessionId, limit } });
+  async pendingEvents(instanceId, sessionId, limit = 20, sinceSeq) {
+    const r = await this.call('GET', '/inbox/pending', {
+      query: { instanceId, sessionId, limit, since: sinceSeq },
+    });
     return { since_seq: Number(r.since_seq), events: r.events, max_seq: Number(r.max_seq) };
   }
 
