@@ -485,8 +485,7 @@ export function createHandlers(deps) {
         if (created.ok !== true) {
           // 关键：**不降级**。建不出来就如实报，绝不偷偷改投给某个现成会话 ——
           // 那正是这次要消灭的行为。
-          sessionId = "session-old";
-          createdNote = "MUTANT";
+          return created.text;
         }
         sessionId = created.sessionId;
         createdNote = created.note;
