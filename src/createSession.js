@@ -95,6 +95,11 @@ export async function createSessionViaHost(ctx, request = {}) {
  * 处理一批待办的建会话请求。**由接收端的收件箱轮询驱动**（不另起定时器：
  * 那样要多一套生命周期与清理，而收件箱本来每轮就会跑一遍）。
  *
+ * 开关关着（`allowCreate !== true`）时**照样读、照样回写**，只是不建会话：
+ * 回写 `create-refused`。这条是 0.3.3 修的缺陷 —— 旧版在这里直接 `return []`，
+ * 于是"对端明确关了开关"和"对端不在线"在派发方眼里都成了等 60s 后的
+ * `create-timeout`，把**明确失败**说成了**没人管**。
+ *
  * @param {object} deps
  * @param {object} deps.board - 板（本地或远端）
  * @param {object} deps.ctx - 宿主上下文
@@ -104,10 +109,6 @@ export async function createSessionViaHost(ctx, request = {}) {
  * @returns {Promise<Array<{request_id:string, sessionId?:string, rejected?:string}>>}
  */
 export async function serviceSessionRequests({ board, ctx, instanceId, allowCreate, limit = 5 }) {
-  if (allowCreate !== true) {
-    // 关着的时候连读都不读：不让"关掉的开关"还产生任何副作用（不建、不写回）。
-    return [];
-  }
   let pending;
   try {
     pending = await board.pendingSessionRequests(instanceId, limit);
@@ -122,7 +123,15 @@ export async function serviceSessionRequests({ board, ctx, instanceId, allowCrea
     if (row.target_instance !== instanceId) continue;
 
     let result;
-    if (canCreateSession(ctx)) {
+    if (allowCreate !== true) {
+      // 开关关着：**不建会话**，但要如实回写"我拒绝了"。
+      // 不写回就等于让派发方白等一个 TTL —— 那是 0.3.2 及以前的缺陷。
+      result = {
+        ok: false,
+        reason: 'create-refused',
+        message: `对端 ${instanceId} 的 allowCreate=false（默认关闭），没有开启远端建会话`,
+      };
+    } else if (canCreateSession(ctx)) {
       result = await createSessionViaHost(ctx, {
         cwd: row.cwd ?? undefined,
         agentPreset: row.agent_preset ?? undefined,

@@ -40,7 +40,7 @@ export const name = 'dsh-team-mesh';
  */
 export const inject = ['tools', 'interconnect'];
 
-export const PLUGIN_VERSION = '0.1.0-prototype';
+export const PLUGIN_VERSION = '0.3.3-prototype';
 
 async function loadDefineTool() {
   try {
@@ -187,44 +187,44 @@ async function registerAll(ctx, config, disposers) {
   // 因为只有接收端有宿主注册表。这条链路能凭空开进程、还会烧对端的模型额度，
   // 所以 allowCreate **默认 false**，和 interconnect 的 allowResume 同一套风格，
   // 但默认值相反 —— resume 只是唤醒已有会话，create 是造一个新的。
+  //
+  // 0.3.3：**开关关着也照样轮询**，只是不建会话、回写 `create-refused`。
+  // 旧版关着就完全不读板，于是派发方要等到 TTL 才拿到 `create-timeout`，
+  // 把"对端明确关了开关"说成"对端不在线"。读一次的成本远小于一次误判。
   const allowCreate = config.allowCreate === true;
-  let serviceCreate = null;
-  let createTimer = null;
-  if (allowCreate) {
-    const selfInstance = (() => {
-      try {
-        return interconnectOf(ctx)?.selfSender?.('__probe__')?.instanceId ?? 'unknown';
-      } catch {
-        return 'unknown';
-      }
-    })();
-    serviceCreate = () =>
-      serviceSessionRequests({
-        board,
-        ctx,
-        instanceId: selfInstance,
-        allowCreate: true,
-        limit: Number(config.createBatchLimit ?? 5),
-      });
-    // 纯空闲兜底：没有新轮次时 pre-step 不会触发，但请求仍应被处理。
-    // 周期取 3s：比 ack 窗口（60s）密得多，又不至于空转打满板。
-    const periodMs = Number(config.createPollMs ?? 3000);
-    createTimer = setInterval(() => {
-      void Promise.resolve()
-        .then(() => serviceCreate())
-        .catch((err) => {
-          try {
-            ctx?.logger?.warn?.(`[dsh-team-mesh] 建会话轮询失败：${err?.message ?? err}`);
-          } catch {
-            /* ignore */
-          }
-        });
-    }, periodMs);
-    if (typeof createTimer.unref === 'function') createTimer.unref();
-    disposers.push(() => {
-      if (createTimer !== null) clearInterval(createTimer);
+  const selfInstance = (() => {
+    try {
+      return interconnectOf(ctx)?.selfSender?.('__probe__')?.instanceId ?? 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  })();
+  const serviceCreate = () =>
+    serviceSessionRequests({
+      board,
+      ctx,
+      instanceId: selfInstance,
+      allowCreate,
+      limit: Number(config.createBatchLimit ?? 5),
     });
-  }
+  // 纯空闲兜底：没有新轮次时 pre-step 不会触发，但请求仍应被处理。
+  // 周期取 3s：比 ack 窗口（60s）密得多，又不至于空转打满板。
+  const periodMs = Number(config.createPollMs ?? 3000);
+  const createTimer = setInterval(() => {
+    void Promise.resolve()
+      .then(() => serviceCreate())
+      .catch((err) => {
+        try {
+          ctx?.logger?.warn?.(`[dsh-team-mesh] 建会话轮询失败：${err?.message ?? err}`);
+        } catch {
+          /* ignore */
+        }
+      });
+  }, periodMs);
+  if (typeof createTimer.unref === 'function') createTimer.unref();
+  disposers.push(() => {
+    if (createTimer !== null) clearInterval(createTimer);
+  });
 
   // ── 自动收件箱：会话下一轮把新事件摘要注入上下文 ──
   // 这是"发起方知情"的实现。对端做完活不主动发消息，我也能看到 done 事件。
@@ -236,7 +236,8 @@ async function registerAll(ctx, config, disposers) {
         ctx,
         board,
         limit: Number(config.inboxLimit ?? 20),
-        // v3：顺手服务建会话请求（没开 allowCreate 时传 null，行为与旧版一致）
+        // v3：顺手服务建会话请求。0.3.3 起开关关着也照样服务（回写 create-refused），
+        // 所以这里不再传 null —— 只是 create 那一步会被跳过。
         serviceSessionRequests: serviceCreate,
         // 默认排除 peer.event：多机同开时这类会话生命周期事件会占满注入窗口，
         // 把真正关心的 task/evidence/gate 事件饿死在后面（实测过的真问题）。

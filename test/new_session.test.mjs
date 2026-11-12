@@ -276,9 +276,9 @@ test('接收端：宿主 create() 抛错 → create-failed，且带上宿主的 
   assert.match(out.message, /gateway\/bad-request/);
 });
 
-test('接收端：allowCreate=false（默认）时**连读都不读**，不产生任何副作用', async () => {
+test('接收端：allowCreate=false（默认）时**照样读、并回写 create-refused**，但绝不建会话', async () => {
   const board = newBoard();
-  board.createSessionRequest({
+  const { request_id } = board.createSessionRequest({
     targetInstance: 'peer-b',
     requesterInstance: 'peer-a',
     ttlMs: 60_000,
@@ -292,12 +292,67 @@ test('接收端：allowCreate=false（默认）时**连读都不读**，不产�
     instanceId: 'peer-b',
     allowCreate: false, // 默认值
   });
-  assert.deepEqual(done, [], '关着时不该处理任何请求');
   assert.equal(called, 0, '关着时绝不能调宿主 create()');
+  assert.deepEqual(done, [{ request_id, rejected: 'create-refused' }], '关着时要如实回写 create-refused');
 
-  // 请求仍留在 pending（没被消费、也没被写结果）
-  const still = board.pendingSessionRequests('peer-b', 5);
-  assert.equal(still.length, 1, '关着时请求应原样留在板上，让派发方等到超时后如实报 create-timeout');
+  // 请求被认领并写了拒绝原因 —— 不是留在板上等 TTL
+  const row = board.getSessionRequest(request_id);
+  assert.equal(row.state, 'claimed', '关着时也要认领（否则派发方只能等到超时）');
+  assert.equal(row.reject_reason, 'create-refused');
+  assert.equal(row.session_id, null, '拒绝时不该有 session_id');
+  assert.equal(board.pendingSessionRequests('peer-b', 5).length, 0, '不该再留在 pending');
+
+  board.close();
+});
+
+test('接收端：allowCreate=false 时派发方**快速**拿到 create-refused，而不是等 TTL 超时', async () => {
+  const board = newBoard();
+  const task = makeTask(board);
+  const ic = fakeInterconnect();
+
+  // 接收端只跑一次 serviceSessionRequests（模拟它开了轮询），开关是关的
+  const receiver = (async () => {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const done = await serviceSessionRequests({ board, ctx: {}, instanceId: 'peer-b', allowCreate: false });
+      if (done.length > 0) return done;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    throw new Error('接收端一直没处理请求');
+  })();
+
+  const h = createHandlers({ getBoard: () => board, getInterconnect: () => ic });
+  // 回执窗口给足 60s：如果实现还在"关着就静默"，这里必然等到 TTL 才返回
+  const t0 = Date.now();
+  const out = await h.mesh_dispatch(
+    { taskId: task.task_id, instanceId: 'peer-b', newSession: true, ackTimeoutMs: 60_000 },
+    exec,
+  );
+  const elapsed = Date.now() - t0;
+  await receiver;
+
+  assert.match(out, /create-refused/, '必须给出 create-refused 这个稳定短码');
+  assert.doesNotMatch(out, /create-timeout/, '不能被混成"没人处理"');
+  assert.ok(elapsed < 5000, `必须快速返回（实测 ${elapsed}ms），不能等满 60s 的 TTL`);
+  assert.equal(ic.calls.length, 0, '被拒时仍然一次投递都不许发（不许降级）');
+
+  board.close();
+});
+
+test('反向对照：对端不在线（没人读板）仍是 create-timeout，不会变成 create-refused', async () => {
+  const board = newBoard();
+  const task = makeTask(board);
+  const ic = fakeInterconnect();
+
+  const h = createHandlers({ getBoard: () => board, getInterconnect: () => ic });
+  const out = await h.mesh_dispatch(
+    { taskId: task.task_id, instanceId: 'peer-b', newSession: true, ackTimeoutMs: 300 },
+    exec,
+  );
+
+  assert.match(out, /create-timeout/, '没人处理就是超时');
+  assert.doesNotMatch(out, /create-refused/, '不能把"不在线"说成"关了开关"');
+  assert.equal(ic.calls.length, 0);
 
   board.close();
 });

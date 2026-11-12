@@ -82,6 +82,20 @@ while (Date.now() < deadline) {
 }
 process.stdout.write('RECEIVER_TIMEOUT'); process.exit(1);
 `,
+  /** 接收方（0.3.3）：开关关着，但照样读板并回写 create-refused。 */
+  receiverRefusing: `
+import { serviceSessionRequests } from './src/createSession.js';
+import { RemoteBoard } from './src/remote.js';
+const board = new RemoteBoard({ endpoint: process.env.E2E_ENDPOINT, token: process.env.E2E_TOKEN });
+const host = { get: (n) => n === 'sessionController' ? { create: async () => ({ sessionId: 'must-not-happen' }) } : undefined };
+const deadline = Date.now() + 20000;
+while (Date.now() < deadline) {
+  const done = await serviceSessionRequests({ board, ctx: host, instanceId: 'peer-b', allowCreate: false });
+  if (done.length > 0) { process.stdout.write('REFUSER_OK ' + JSON.stringify(done)); process.exit(0); }
+  await new Promise(r => setTimeout(r, 100));
+}
+process.stdout.write('REFUSER_TIMEOUT'); process.exit(1);
+`,
   /** 派发方：调 mesh_dispatch({ newSession: true })，把结果打出来。 */
   dispatcher: `
 import { createHandlers } from './src/handlers.js';
@@ -95,8 +109,9 @@ const ic = {
   send: async (req) => { sent.push(req); return { delivered: true, instance: req.instanceId, delivery: 'followup' }; },
 };
 const h = createHandlers({ getBoard: () => board, getInterconnect: () => ic });
+const t = process.env.E2E_TIMEOUT === undefined ? undefined : Number(process.env.E2E_TIMEOUT);
 const out = await h.mesh_dispatch(
-  { taskId: process.env.E2E_TASK, instanceId: 'peer-b', newSession: true },
+  { taskId: process.env.E2E_TASK, instanceId: 'peer-b', newSession: true, ...(t === undefined ? {} : { ackTimeoutMs: t }) },
   { agent: { id: 'session-orch' } },
 );
 process.stdout.write(JSON.stringify({ out, sent }));
@@ -149,13 +164,22 @@ try {
   check('板上 dispatch 记录标了 created_session=1', row !== undefined && Number(row.created_session) === 1);
   check('板上 dispatch 记录指向新会话', row !== undefined && row.peer_session === 'session-from-receiver');
 
-  process.stdout.write('\n── 场景 2：接收方不开开关 → 派发方如实报 create-timeout，不降级 ──\n');
-  const task2 = board.createTask({ title: 'e2e 无人处理', brief: '', acceptance: '', requestId: null }, 'session-orch').task;
+  process.stdout.write('\n── 场景 2：接收方开着但 allowCreate=false → 派发方**快速**拿到 create-refused，不降级 ──\n');
+  const task2 = board.createTask({ title: 'e2e 对端关了开关', brief: '', acceptance: '', requestId: null }, 'session-orch').task;
+  const refuserId = writeChild('receiverRefusing');
+  const refuserPromise = runChild(refuserId, { E2E_ENDPOINT: endpoint, E2E_TOKEN: TOKEN });
+  await new Promise((r) => setTimeout(r, 300));
+  const t2 = Date.now();
   const dispRes2 = await runChild(dispatcherPath, {
     E2E_ENDPOINT: endpoint,
     E2E_TOKEN: TOKEN,
     E2E_TASK: task2.task_id,
   });
+  const elapsed2 = Date.now() - t2;
+  const refuserRes = await refuserPromise;
+  fs.rmSync(refuserId, { force: true });
+
+  check('接收方（关着开关）确实读了板并回写', refuserRes.out.includes('REFUSER_OK'), refuserRes.out.trim().slice(0, 120));
   let parsed2 = null;
   try {
     parsed2 = JSON.parse(dispRes2.out.trim().split('\n').pop());
@@ -164,8 +188,31 @@ try {
   }
   check('派发方拿到结果（场景2）', parsed2 !== null, dispRes2.out.slice(0, 200));
   if (parsed2 !== null) {
-    check('明确报 create-timeout', /create-timeout/.test(parsed2.out));
+    check('明确报 create-refused', /create-refused/.test(parsed2.out));
+    check('没被混成 create-timeout', !/create-timeout/.test(parsed2.out));
+    check('**快速**返回（远早于 60s 的 TTL）', elapsed2 < 15000, `实测 ${elapsed2}ms`);
     check('**一次 send 都没发**（没有降级）', parsed2.sent.length === 0, `实际 ${parsed2.sent.length} 次`);
+  }
+
+  process.stdout.write('\n── 场景 3：对端根本没人读板 → 仍是 create-timeout，不能混成 create-refused ──\n');
+  const task3 = board.createTask({ title: 'e2e 无人处理', brief: '', acceptance: '', requestId: null }, 'session-orch').task;
+  const dispRes3 = await runChild(dispatcherPath, {
+    E2E_ENDPOINT: endpoint,
+    E2E_TOKEN: TOKEN,
+    E2E_TASK: task3.task_id,
+    E2E_TIMEOUT: '2000',
+  });
+  let parsed3 = null;
+  try {
+    parsed3 = JSON.parse(dispRes3.out.trim().split('\n').pop());
+  } catch {
+    /* 判下面 */
+  }
+  check('派发方拿到结果（场景3）', parsed3 !== null, dispRes3.out.slice(0, 200));
+  if (parsed3 !== null) {
+    check('明确报 create-timeout', /create-timeout/.test(parsed3.out));
+    check('没被混成 create-refused', !/create-refused/.test(parsed3.out));
+    check('**一次 send 都没发**（没有降级）', parsed3.sent.length === 0, `实际 ${parsed3.sent.length} 次`);
   }
 } finally {
   // 板服务自己持有 http server；close() 不等回调（等的话会挂住不退出）。
