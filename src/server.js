@@ -102,7 +102,19 @@ async function readJson(req) {
  * 处理函数只做参数搬运，判定一律落在 Board 上（Board 内部再落 domain）。
  */
 function makeRoutes(board) {
-  return {
+  /** 进程内 sweep 的自证状态。挂到 /health 上，让「定时器到底跑没跑」可被外部观测。 */
+  const sweepState = {
+    enabled: false,
+    interval_ms: null,
+    runs: 0,
+    failures: 0,
+    last_run_at: null,
+    last_ok_at: null,
+    last_error: null,
+    last_result: null,
+  };
+
+  const routes = {
     'GET /health': () => ({
       ok: true,
       service: 'dsh-team-mesh board',
@@ -110,6 +122,9 @@ function makeRoutes(board) {
       schema_version: 1,
       board: board.dbPath ?? null,
       blobs: board.backend.countBlobs ? board.backend.countBlobs() : null,
+      // P0-1 观测点：不改数据库、不加路由，只把内存里的计数器读出来。
+      // 有它就能证明「定时 sweep 真的在跑」，而不是只能相信代码里有个 setInterval。
+      sweep: { ...sweepState },
     }),
 
     'POST /task/create': (_ctx, _p, body) => {
@@ -271,12 +286,58 @@ function makeRoutes(board) {
       events: board.recentEvents(params.limit ?? 20, params.taskId ?? null),
     }),
   };
+
+  return { routes, sweepState };
 }
 
-/** 哪些路由需要密钥。/health 是探活，不需要；其余全要。 */
+/**
+ * 只读路由白名单（P0-2）。
+ *
+ * 只有「读数据、不改任何状态」的 GET 才允许进这张表。判据是**能不能改库**，
+ * 不是「像不像查询」：
+ * - `GET /health` 探活，天然公开（启动自检靠它，不能要求先有密钥）。
+ * - `GET /cursor` 读游标是只读；`POST /cursor` 前移游标是写，所以不在表里。
+ * - `GET /inbox/pending` 只读事件、**不前移游标**（前移是单独的 POST），故可入表。
+ * - `GET /blob/get` / `GET /blob/stat` 读内容寻址对象，只读。
+ *
+ * 任何新加的 POST 一律不在表里 —— 漏写只会更严，不会更松。
+ */
+const READ_ONLY_ROUTES = new Set([
+  'GET /health',
+  'GET /task/list',
+  'GET /task/get',
+  'GET /task/evidence',
+  'GET /acks',
+  'GET /events',
+  'GET /inbox/pending',
+  'GET /cursor',
+  'GET /session-request/get',
+  'GET /session-request/pending',
+  'GET /blob/get',
+  'GET /blob/stat',
+]);
+
+/**
+ * 这条请求需要哪一级密钥。
+ *
+ * 返回 `'none' | 'read' | 'write'`。调用方据此选择用哪把密钥去比。
+ * 分三级而不是布尔，是为了让「写」这个最强权限永远不可能被只读密钥满足 ——
+ * 布尔值一旦写成 `if (needAuth && tokenOk)`，只读密钥就能过写路由。
+ *
+ * @param {string} method HTTP 方法
+ * @param {string} pathname 已归一化的路径
+ * @returns {'none'|'read'|'write'}
+ */
+function requiredAuthLevel(method, pathname) {
+  const key = `${method} ${pathname}`;
+  if (key === 'GET /health') return 'none';
+  if (READ_ONLY_ROUTES.has(key)) return 'read';
+  return 'write';
+}
+
+/** 向后兼容包装：仍返回布尔（是否需要任何密钥）。新代码请用 requiredAuthLevel。 */
 function needsAuth(method, pathname) {
-  if (method === 'GET' && pathname === '/health') return false;
-  return true;
+  return requiredAuthLevel(method, pathname) !== 'none';
 }
 
 /**
@@ -286,15 +347,36 @@ function needsAuth(method, pathname) {
 export async function startBoardService(opts = {}) {
   const host = opts.host ?? '127.0.0.1';
   const port = opts.port ?? 13090;
-  const token = opts.token ?? process.env.DSH_TEAM_BOARD_TOKEN ?? '';
+  // 写密钥：能读能写。沿用旧变量名，旧部署一行不改就能跑。
+  const writeToken = opts.token ?? process.env.DSH_TEAM_BOARD_TOKEN ?? '';
+  // 只读密钥：只能读。**没配就退化为写密钥** —— 这样默认部署的权限模型与改造前完全等价，
+  // 不会因为这次升级就把现网读请求打成 401（向后兼容优先于「默认更严」）。
+  const readToken = opts.readToken ?? process.env.DSH_TEAM_BOARD_READ_TOKEN ?? writeToken;
+  const token = writeToken; // 兼容旧引用
   const board = opts.board ?? new Board(opts.boardPath);
-  const routes = makeRoutes(board);
+  const { routes, sweepState } = makeRoutes(board);
   const log = opts.logger ?? console;
 
-  if (token === '') {
+  if (writeToken === '') {
     // fail-closed：没有密钥就只允许本机只读探活，写操作一律 401。
     // 这不是"宽容模式"，是明确留一条可诊断的路径：客户端会收到 UNAUTHORIZED 并知道要配密钥。
     log.warn?.('[board] 未设置 DSH_TEAM_BOARD_TOKEN：所有写操作将被拒绝（fail-closed）');
+  }
+  if (writeToken !== '' && readToken === writeToken) {
+    // 明确告知：只读密钥没单独配，此时「分级」是逻辑上存在、实际等价于单密钥。
+    log.info?.('[board] 未设置 DSH_TEAM_BOARD_READ_TOKEN：只读密钥退化为写密钥（权限模型与旧版等价）');
+  }
+
+  /**
+   * 需要时按级别校验。路由不认识时按 `write` 处理 —— 未知路径也不该被白嫖。
+   * @param {import('node:http').IncomingMessage} req
+   * @param {string} method
+   * @param {string} pathname
+   */
+  function requireAuthIfNeeded(req, method, pathname) {
+    const level = requiredAuthLevel(method, pathname);
+    if (level === 'none') return;
+    requireAuth(req, level);
   }
 
   const server = http.createServer(async (req, res) => {
@@ -308,7 +390,7 @@ export async function startBoardService(opts = {}) {
 
       // ── blob 上传/下载单独处理：走二进制，不走 JSON ──
       if (pathname === '/blob/put' && method === 'POST') {
-        if (needsAuth(method, pathname)) requireAuth(req, token);
+        requireAuthIfNeeded(req, method, pathname);
         const bytes = await readBody(req, MAX_BLOB_BYTES);
         if (bytes.length === 0) throw new TeamError('INVALID_INPUT', 'blob 内容为空');
         // key 由服务端算：客户端只给字节，无法指定哈希
@@ -316,7 +398,7 @@ export async function startBoardService(opts = {}) {
         return sendJson(res, 200, { ok: true, ...out });
       }
       if (pathname === '/blob/get' && method === 'GET') {
-        if (needsAuth(method, pathname)) requireAuth(req, token);
+        requireAuthIfNeeded(req, method, pathname);
         const sha = String(params.sha256 ?? '');
         const got = board.backend.getBlob(sha);
         if (got === null) throw new TeamError('BLOB_NOT_FOUND', `板上没有这个对象：${sha}`);
@@ -329,7 +411,7 @@ export async function startBoardService(opts = {}) {
         return res.end(got.bytes);
       }
       if (pathname === '/blob/stat' && method === 'GET') {
-        if (needsAuth(method, pathname)) requireAuth(req, token);
+        requireAuthIfNeeded(req, method, pathname);
         const sha = String(params.sha256 ?? '');
         const st = board.backend.statBlob(sha);
         if (st === null) throw new TeamError('BLOB_NOT_FOUND', `板上没有这个对象：${sha}`);
@@ -343,7 +425,7 @@ export async function startBoardService(opts = {}) {
           error: { code: 'NO_ROUTE', message: `没有这个接口：${method} ${pathname}` },
         });
       }
-      if (needsAuth(method, pathname)) requireAuth(req, token);
+      requireAuthIfNeeded(req, method, pathname);
       const body = method === 'POST' ? await readJson(req) : {};
       const out = handler({}, params, body);
       return sendJson(res, 200, out);
@@ -352,13 +434,40 @@ export async function startBoardService(opts = {}) {
     }
   });
 
-  function requireAuth(req, expected) {
-    if (expected === '') {
+  /**
+   * 按权限级别校验密钥。
+   *
+   * 两把密钥的语义（**向后兼容是硬要求**：现网只配了写密钥，只读密钥默认等于写密钥）：
+   * - `writeToken`：能读能写。旧客户端、DSH 插件全用它，行为与改造前完全一致。
+   * - `readToken`：只能读。没配 `DSH_TEAM_BOARD_READ_TOKEN` 时**退化为 writeToken**，
+   *   于是「未配置只读密钥」这种默认状态下，权限模型与改造前 100% 等价（不收紧也不放松）。
+   *
+   * fail-closed 保留：写密钥为空时一切写操作仍 401，绝不因为加了分级就放开写。
+   *
+   * @param {import('node:http').IncomingMessage} req
+   * @param {'read'|'write'} level 这条路由要求的最低权限
+   */
+  function requireAuth(req, level) {
+    const got = req.headers['x-team-token'];
+    const gotStr = typeof got === 'string' ? got : '';
+
+    if (level === 'read') {
+      // 只读：写密钥或只读密钥任一命中即可（写密钥必然能读）。
+      const okWrite = writeToken !== '' && safeEqual(gotStr, writeToken);
+      const okRead = readToken !== '' && safeEqual(gotStr, readToken);
+      if (okWrite || okRead) return;
+      if (writeToken === '' && readToken === '') {
+        throw new TeamError('UNAUTHORIZED', '板服务端没有配置任何密钥，只读路由也拒绝（fail-closed）');
+      }
+      throw new TeamError('UNAUTHORIZED', '密钥不匹配或缺少密钥（只读路由需要 read 或 write 密钥）');
+    }
+
+    // 写：**只认写密钥**。只读密钥在这里必然失败 —— 这是分级的意义所在。
+    if (writeToken === '') {
       throw new TeamError('UNAUTHORIZED', '板服务端没有配置 DSH_TEAM_BOARD_TOKEN，写操作一律拒绝（fail-closed）');
     }
-    const got = req.headers['x-team-token'];
-    if (typeof got !== 'string' || !safeEqual(got, expected)) {
-      throw new TeamError('UNAUTHORIZED', '共享密钥不匹配（检查客户端的 boardToken）');
+    if (!safeEqual(gotStr, writeToken)) {
+      throw new TeamError('UNAUTHORIZED', '写密钥不匹配（检查客户端的 boardToken）');
     }
   }
 
@@ -371,12 +480,74 @@ export async function startBoardService(opts = {}) {
   });
 
   const addr = server.address();
+
+  // ── P0-1 方案 A：进程内定时 sweep ──
+  //
+  // 修的问题：`board.sweepAll()` 原来只有 `src/inbox.js:62` 一个调用点，
+  // 也就是说「有会话活动时顺带扫一次」。板安静（没人开新轮次）时，
+  // 过期租约与 ack 超时永远不会被标出来，板状态长期停在旧样子。
+  //
+  // 为什么放在服务进程里而不是外部脚本：清扫写的是**这个进程自己持有的**那块库，
+  // 同进程调用能复用已有的写事务与串行化，不需要跨进程抢 SQLite 写锁，
+  // 也不需要把密钥再复制一份到脚本里。
+  //
+  // 三条防御，缺一条都不该上线：
+  // 1. `unref()`：定时器不阻止进程退出。否则 Ctrl-C / 服务重启会被这个 interval 挂住。
+  // 2. `try/catch` 包住每一轮：一次清扫抛异常（库锁、磁盘满）不能杀掉整个板服务 ——
+  //    板服务是 20 张真卡的唯一入口，为了清扫把服务搞挂是本末倒置。
+  // 3. 重入保护：上一轮还没跑完就不开下一轮。清扫是幂等的，但堆叠会浪费写锁。
+  const sweepMs = Number(opts.sweepIntervalMs ?? process.env.DSH_TEAM_BOARD_SWEEP_MS ?? 60000);
+  const sweepEnabled = Number.isFinite(sweepMs) && sweepMs > 0 && opts.sweep !== false;
+  let sweepTimer = null;
+  let sweeping = false;
+  sweepState.enabled = sweepEnabled;
+  sweepState.interval_ms = sweepEnabled ? sweepMs : null;
+
+  function runSweepOnce() {
+    if (sweeping) return;
+    sweeping = true;
+    sweepState.runs += 1;
+    sweepState.last_run_at = Date.now();
+    try {
+      const res = board.sweepAll(sweepState.last_run_at);
+      sweepState.last_ok_at = sweepState.last_run_at;
+      sweepState.last_result = {
+        ack_timeouts: res?.ack?.count ?? 0,
+        lease_stale: res?.lease?.count ?? 0,
+        session_request_expired: typeof res?.session_request === 'number' ? res.session_request : null,
+      };
+    } catch (err) {
+      // 清扫失败只记账，不抛出：下一次 tick 会重试，服务照常对外。
+      sweepState.failures += 1;
+      sweepState.last_error = String(err?.message ?? err);
+      try {
+        log.warn?.(`[board] 定时 sweep 失败（第 ${sweepState.failures} 次）：${sweepState.last_error}`);
+      } catch {
+        /* 日志本身失败也不能影响服务 */
+      }
+    } finally {
+      sweeping = false;
+    }
+  }
+
+  if (sweepEnabled) {
+    sweepTimer = setInterval(runSweepOnce, sweepMs);
+    if (typeof sweepTimer.unref === 'function') sweepTimer.unref();
+    log.info?.(`[board] 定时 sweep 已启用：每 ${sweepMs} ms 扫一次过期租约 / ack 超时 / 过期建会话请求`);
+  } else {
+    log.warn?.('[board] 定时 sweep 已禁用（DSH_TEAM_BOARD_SWEEP_MS<=0 或 sweep:false）——过期租约需外部触发 POST /sweep');
+  }
+
   return {
     server,
     board,
+    sweepState,
+    /** 手动跑一轮 sweep（测试与外部触发用，和定时器走同一条路径）。 */
+    runSweepOnce,
     port: typeof addr === 'object' && addr !== null ? addr.port : port,
     host,
     async close() {
+      if (sweepTimer !== null) clearInterval(sweepTimer);
       await new Promise((resolve) => server.close(resolve));
       board.close();
     },
@@ -394,7 +565,11 @@ if (isMain) {
     .then((svc) => {
       console.log(`[board] listening on http://${svc.host}:${svc.port}`);
       console.log(`[board] db = ${svc.board.dbPath}`);
-      console.log(`[board] auth = ${process.env.DSH_TEAM_BOARD_TOKEN ? 'token 已配置' : '未配置（写操作会被拒绝）'}`);
+      console.log(`[board] auth = ${process.env.DSH_TEAM_BOARD_TOKEN ? '写密钥已配置' : '未配置（写操作会被拒绝）'}`);
+      console.log(
+        `[board] read-key = ${process.env.DSH_TEAM_BOARD_READ_TOKEN ? '只读密钥已单独配置' : '未单独配置（只读退化为写密钥，与旧版等价）'}`,
+      );
+
     })
     .catch((err) => {
       console.error(`[board] 启动失败：${err?.message ?? err}`);
