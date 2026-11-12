@@ -23,9 +23,6 @@ src.orig-0.3.1-pristine/
 test.orig-0.3.1-pristine/
 *.orig-*-pristine/
 
-# ---- 含硬编码凭据的端到端测试脚本：不入库（见 MANIFEST 的密钥扫描一节） ----
-tools/e2e_new_session.mjs
-
 # ---- 临时探针 / 一次性调试脚本 ----
 probe-asar.mjs
 probe-*.mjs
