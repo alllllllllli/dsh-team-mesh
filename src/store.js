@@ -36,6 +36,7 @@ import {
   processIdentity,
   TERMINAL,
   TeamError,
+  VERIFICATION_METHODS,
 } from './domain.js';
 import { LocalSqliteBackend, defaultBoardPath } from './backend.js';
 import { parseRef } from './refs.js';
@@ -124,6 +125,8 @@ export class Board {
 
   createTask(input, actor) {
     const { title, brief, acceptance, requestId } = input;
+    // v4：可选门禁开关。老调用方不传 → false → 落库 0 → 门禁行为与 v3 一致。
+    const requireIndependentReview = input.requireIndependentReview === true;
     return this.tx(() => {
       if (requestId !== null) {
         const prior = this.backend.findTaskByIdempotencyKey(requestId);
@@ -146,7 +149,16 @@ export class Board {
         created_at: now,
         updated_at: now,
       });
-      this.appendEvent('task.created', taskId, actor, { title, request_id: requestId });
+      if (requireIndependentReview) {
+        // 建完再单独 CAS 一次，而不是改 insertTask 的列清单：
+        // insertTask 是 v1 就在用的原语，给它加列会让老路径也走新分支。
+        this.backend.updateTaskCas(taskId, 1, { require_independent_review: 1 });
+      }
+      this.appendEvent('task.created', taskId, actor, {
+        title,
+        request_id: requestId,
+        require_independent_review: requireIndependentReview ? 1 : 0,
+      });
       const row = this.backend.readTaskRow(taskId);
       return { task: this.rowToTask(row), deduped: false };
     });
@@ -408,6 +420,9 @@ export class Board {
       : String(input.evidenceRef).trim();
     const evidenceRef = rawRef !== null && rawRef.length > 0 ? rawRef : null;
 
+    // v4 复核字段：全部可选。给了才校验，不给就是 NULL（老行为）。
+    const review = normalizeReviewFields(input);
+
     const resolved = evidenceRef === null
       ? { kind: 'none', exists: false, sha256: null, size: null, raw: '' }
       : resolveRef(this.backend, evidenceRef);
@@ -440,6 +455,11 @@ export class Board {
         ref_sha256: resolved.sha256,
         ref_size: resolved.size,
         created_at: now,
+        // v4
+        verified_by: review.verifiedBy,
+        verified_at: review.verifiedBy === null ? null : (review.verifiedAt ?? now),
+        acceptance_ref: review.acceptanceRef,
+        verification_method: review.verificationMethod,
       });
       this.appendEvent('evidence.recorded', taskId, actor, {
         evidence_id: evidenceId,
@@ -448,6 +468,10 @@ export class Board {
         reasons: verdict.reasons,
         ref_sha256: resolved.sha256,
         ref_kind: resolved.kind,
+        // v4：复核信息也进审计 —— 事后查"谁验的"不该只依赖 evidence 表
+        verified_by: review.verifiedBy,
+        acceptance_ref: review.acceptanceRef,
+        verification_method: review.verificationMethod,
       });
       if (task.lifecycle === 'blocked' && verdict.admissible) {
         // 报来可采信证据说明又动了工：从 blocked 退回 working
@@ -460,12 +484,55 @@ export class Board {
         ref_sha256: resolved.sha256,
         ref_size: resolved.size,
         ref_kind: resolved.kind,
+        // v4：原样回显，调用方不必再查一遍库
+        verified_by: review.verifiedBy,
+        verified_at: review.verifiedBy === null ? null : (review.verifiedAt ?? now),
+        acceptance_ref: review.acceptanceRef,
+        verification_method: review.verificationMethod,
       };
     });
   }
 
   listEvidence(taskId) {
     return this.backend.queryEvidence(taskId);
+  }
+
+  /**
+   * v4：打开/关闭该任务的「独立复核」门禁。
+   *
+   * 为什么要有这个开关而不是全局强制：门禁一强制，所有现存 24 张卡立刻变成
+   * "永远完不成"，而它们的历史证据里根本没有 verified_by。默认关闭 + 逐任务打开，
+   * 是唯一不破坏老数据的做法。
+   *
+   * 谁能改：任务的 created_by 或当前 owner。其他人改等于替别人定验收规则。
+   *
+   * @param {string} taskId
+   * @param {boolean} required
+   * @param {string} actor 调用者
+   */
+  setIndependentReview(taskId, required, actor) {
+    return this.tx(() => {
+      const row = this.backend.readTaskRow(taskId);
+      if (row === undefined || row === null) throw new TeamError('TASK_NOT_FOUND', `任务不存在：${taskId}`);
+      const task = this.rowToTask(row);
+      if (TERMINAL.has(task.lifecycle)) {
+        throw new TeamError('TASK_CLOSED', `任务已终结（${task.lifecycle}），不能改门禁`);
+      }
+      const allowed = actor === task.created_by || actor === task.owner_session;
+      if (!allowed) {
+        throw new TeamError(
+          'NOT_ALLOWED',
+          `只有任务创建者（${task.created_by}）或当前负责人（${task.owner_session ?? '无人'}）能改这个开关，你是 ${actor}`,
+        );
+      }
+      const value = required === true ? 1 : 0;
+      const ok = this.backend.updateTaskCas(taskId, task.version, { require_independent_review: value });
+      if (!ok) throw new TeamError('CONFLICT', `任务 ${taskId} 在你读之后被改过，请重试`);
+      this.appendEvent('task.review_policy_changed', taskId, actor, {
+        require_independent_review: value,
+      });
+      return { task: this.getTask(taskId) };
+    });
   }
 
   /**
@@ -810,6 +877,7 @@ export class Board {
         ? null
         : Number(row.lease_start_sec),
       lease_host: row.lease_host ?? null,
+      require_independent_review: Number(row.require_independent_review ?? 0),
     };
   }
 }
@@ -847,6 +915,59 @@ function safeParse(text) {
   } catch {
     return { _raw: String(text) };
   }
+}
+
+/**
+ * v4：把 reportEvidence 的四个可选复核字段规范化。
+ *
+ * 全部缺省 → 四个 null，落库写 NULL，行为与 v3 一致。
+ * 给了就校验，宁可报错也不落半条：一个拼错的 verification_method 混进库里，
+ * 事后做统计时才发现，那时已经分不清哪些是笔误、哪些是真的。
+ *
+ * @param {object} input
+ * @returns {{verifiedBy:string|null, verifiedAt:number|null, acceptanceRef:string|null, verificationMethod:string|null}}
+ */
+export function normalizeReviewFields(input) {
+  const pick = (v) => (v === undefined || v === null ? null : String(v).trim());
+
+  const verifiedBy = pick(input.verifiedBy);
+  const acceptanceRef = pick(input.acceptanceRef);
+  const verificationMethod = pick(input.verificationMethod);
+  const rawVerifiedAt = input.verifiedAt;
+
+  if (verifiedBy !== null && verifiedBy.length === 0) {
+    throw new TeamError('INVALID_FIELD', 'verifiedBy 不能是空字符串（要么给一个复核人，要么不传）');
+  }
+  if (verifiedBy !== null && verifiedBy.length > 256) {
+    throw new TeamError('INVALID_FIELD', `verifiedBy 过长（${verifiedBy.length} > 256）`);
+  }
+  if (acceptanceRef !== null && acceptanceRef.length === 0) {
+    throw new TeamError('INVALID_FIELD', 'acceptanceRef 不能是空字符串（要么给条目号，要么不传）');
+  }
+  if (acceptanceRef !== null && acceptanceRef.length > 64) {
+    throw new TeamError('INVALID_FIELD', `acceptanceRef 过长（${acceptanceRef.length} > 64）`);
+  }
+  if (verificationMethod !== null && !VERIFICATION_METHODS.includes(verificationMethod)) {
+    throw new TeamError(
+      'INVALID_FIELD',
+      `verificationMethod 必须是 ${VERIFICATION_METHODS.join(' / ')} 之一，收到：${verificationMethod}`,
+    );
+  }
+
+  let verifiedAt = null;
+  if (rawVerifiedAt !== undefined && rawVerifiedAt !== null) {
+    const n = Number(rawVerifiedAt);
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new TeamError('INVALID_FIELD', `verifiedAt 必须是正的毫秒时间戳，收到：${String(rawVerifiedAt)}`);
+    }
+    verifiedAt = Math.floor(n);
+  }
+  // verifiedAt 只在有 verifiedBy 时才有意义；单给时间没有复核人等于没说谁验的
+  if (verifiedBy === null && verifiedAt !== null) {
+    throw new TeamError('INVALID_FIELD', '给了 verifiedAt 就必须同时给 verifiedBy（否则不知道是谁验的）');
+  }
+
+  return { verifiedBy, verifiedAt, acceptanceRef, verificationMethod };
 }
 
 export function openBoard(boardPath) {

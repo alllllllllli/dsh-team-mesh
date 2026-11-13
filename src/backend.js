@@ -46,7 +46,9 @@ CREATE TABLE IF NOT EXISTS task (
   -- v4：租约身份（防 PID 复用）。三个都可空 —— 老数据为 NULL 时行为与 v3 完全一致。
   lease_pid               INTEGER,
   lease_start_sec         INTEGER,
-  lease_host              TEXT
+  lease_host              TEXT,
+  -- v4：可选「独立复核」门禁。默认 0 = 关闭，老任务行为完全不变。
+  require_independent_review INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS evidence (
@@ -61,7 +63,12 @@ CREATE TABLE IF NOT EXISTS evidence (
   evidence_ref TEXT,
   ref_sha256   TEXT,
   ref_size     INTEGER,
-  created_at   INTEGER NOT NULL
+  created_at   INTEGER NOT NULL,
+  -- v4：结构化复核信息。四个都可空 —— 老数据为 NULL，老逻辑不读它们。
+  verified_by          TEXT,
+  verified_at          INTEGER,
+  acceptance_ref       TEXT,
+  verification_method  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_evidence_task ON evidence(task_id, evidence_id);
@@ -199,7 +206,27 @@ const TASK_V4_COLUMNS = [
   ['lease_pid', 'INTEGER'],
   ['lease_start_sec', 'INTEGER'],
   ['lease_host', 'TEXT'],
+  ['require_independent_review', 'INTEGER NOT NULL DEFAULT 0'],
 ];
+
+/**
+ * v4 给 evidence 表追加的列 —— **结构化复核信息**。
+ *
+ * 病根：v3 的 evidence 只有 `actor`（谁报的）+ `evidence_ref`（指向什么）。
+ * 缺三样东西，验收时必然扯皮：
+ *   谁验的（verified_by，必须允许与 actor 不同）
+ *   什么时候验的（verified_at）
+ *   验的是哪一条验收标准（acceptance_ref，如 A03）
+ *   用什么方法验的（verification_method：disk-hash / manual-review / test-run）
+ * 四个都可空：老证据保持 NULL，老逻辑一个字都不读它们。
+ */
+const EVIDENCE_V4_COLUMNS = [
+  ['verified_by', 'TEXT'],
+  ['verified_at', 'INTEGER'],
+  ['acceptance_ref', 'TEXT'],
+  ['verification_method', 'TEXT'],
+];
+
 
 export class LocalSqliteBackend {
   constructor(dbPath) {
@@ -217,6 +244,7 @@ export class LocalSqliteBackend {
     this.migrateTaskV2();
     this.migrateDispatchV3();
     this.migrateTaskV4();
+    this.migrateEvidenceV4();
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
     if (row === undefined) {
       this.db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
@@ -272,6 +300,11 @@ export class LocalSqliteBackend {
   /** v4 迁移：task 表补租约身份列 + 独立复核开关。幂等，老行一律 NULL / 0。 */
   migrateTaskV4() {
     return this.addColumnsIfMissing('task', TASK_V4_COLUMNS);
+  }
+
+  /** v4 迁移：evidence 表补结构化复核列。幂等，老行一律 NULL。 */
+  migrateEvidenceV4() {
+    return this.addColumnsIfMissing('evidence', EVIDENCE_V4_COLUMNS);
   }
 
   close() {
@@ -354,8 +387,9 @@ export class LocalSqliteBackend {
     const info = this.db
       .prepare(
         `INSERT INTO evidence(task_id, actor, executed, outcome, admissible, reasons, note,
-           evidence_ref, ref_sha256, ref_size, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+           evidence_ref, ref_sha256, ref_size, created_at,
+           verified_by, verified_at, acceptance_ref, verification_method)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         row.task_id,
@@ -369,6 +403,11 @@ export class LocalSqliteBackend {
         row.ref_sha256,
         row.ref_size,
         row.created_at,
+        // v4：四个复核字段都可空，缺省写 NULL（老调用方不传，行为与 v3 一致）
+        row.verified_by ?? null,
+        row.verified_at ?? null,
+        row.acceptance_ref ?? null,
+        row.verification_method ?? null,
       );
     return Number(info.lastInsertRowid);
   }

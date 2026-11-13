@@ -134,6 +134,8 @@ function makeRoutes(board) {
           brief: body.brief ?? '',
           acceptance: body.acceptance ?? '',
           requestId: body.requestId ?? null,
+          // v4：可选，缺省 false（老调用方不传 → 行为不变）
+          requireIndependentReview: body.requireIndependentReview === true,
         },
         body.actor ?? 'unknown',
       );
@@ -175,7 +177,22 @@ function makeRoutes(board) {
           outcome: body.outcome,
           note: body.note,
           evidenceRef: body.evidenceRef,
+          // v4：结构化复核字段（全部可选，不传即 NULL，老行为不变）
+          verifiedBy: body.verifiedBy,
+          verifiedAt: body.verifiedAt,
+          acceptanceRef: body.acceptanceRef,
+          verificationMethod: body.verificationMethod,
         },
+        body.actor ?? 'unknown',
+      );
+      return { ok: true, ...res };
+    },
+
+    /** v4：开关某任务的「独立复核」门禁。默认关闭，逐任务打开。 */
+    'POST /task/review-policy': (_ctx, _p, body) => {
+      const res = board.setIndependentReview(
+        body.taskId,
+        body.requireIndependentReview === true,
         body.actor ?? 'unknown',
       );
       return { ok: true, ...res };

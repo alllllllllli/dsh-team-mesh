@@ -67,6 +67,12 @@ export function createSpec() {
       brief: { type: 'string', description: '背景与要求，写清楚对方需要知道的东西（≤4000 字）' },
       acceptance: { type: 'string', description: '验收标准：怎样算做完（≤4000 字）' },
       requestId: { type: 'string', description: '幂等键；同一意图重复提交时填同一个值' },
+      requireIndependentReview: {
+        type: 'boolean',
+        description:
+          '是否要求独立复核（可选，默认 false）。为 true 时，完成门禁要求最后一条可采信证据的 '
+          + 'verifiedBy 存在且不等于上报人；否则拒绝并给出 INDEPENDENT_REVIEW_REQUIRED。',
+      },
     },
     output: textOut,
   };
@@ -137,6 +143,24 @@ export function reportSpec() {
       evidenceRef: {
         type: 'string',
         description: '真实产物的绝对路径（判 pass 时必填；必须是磁盘上真实存在的普通文件）',
+      },
+      verifiedBy: {
+        type: 'string',
+        description:
+          '谁复核的（可选）。**允许与上报人不同** —— 任务开了 requireIndependentReview 时，'
+          + '这一项必须存在且不能等于上报人，否则完成门禁会拒。',
+      },
+      verifiedAt: {
+        type: 'integer',
+        description: '复核时间（可选，毫秒时间戳；给了 verifiedBy 才允许给，缺省用当前时间）',
+      },
+      acceptanceRef: {
+        type: 'string',
+        description: '对应任务 acceptance 里的哪一条（可选，如 A03）',
+      },
+      verificationMethod: {
+        type: 'string',
+        description: '怎么验的（可选）：disk-hash / manual-review / test-run 三者之一',
       },
     },
     output: textOut,

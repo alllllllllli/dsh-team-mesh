@@ -23,6 +23,15 @@ export const OUTCOMES = ['pass', 'fail', 'unknown'];
 /** 终态：不能再改，也不能再报证据。 */
 export const TERMINAL = new Set(['done', 'canceled']);
 
+/**
+ * v4：复核方式白名单。
+ *
+ * 为什么要白名单而不是自由字符串：`verification_method` 存在的意义是让"这条证据
+ * 是怎么被验的"变成**可比较的事实**。自由字符串会立刻长出
+ * "disk-hash / diskHash / 磁盘哈希 / hash" 四种写法，聚合统计就废了。
+ * 三种覆盖现有全部场景：代码自己算的哈希、人工看过的复核、跑过测试。
+ */
+export const VERIFICATION_METHODS = ['disk-hash', 'manual-review', 'test-run'];
 
 export class TeamError extends Error {
   constructor(code, message, detail) {
@@ -60,7 +69,9 @@ export function validateCreateInput(input) {
   const requestId = input.requestId === undefined
     ? null
     : assertNonEmptyString(input.requestId, 'requestId', 200);
-  return { title, brief, acceptance, requestId };
+  // v4：可选「独立复核」门禁，缺省 false（老调用方不传，行为完全不变）
+  const requireIndependentReview = input.requireIndependentReview === true;
+  return { title, brief, acceptance, requestId, requireIndependentReview };
 }
 
 /**
@@ -122,6 +133,31 @@ export function evaluateCompletion(task, evidences) {
       allowed: false,
       reasons: [`LATEST_UNKNOWN: 最后一条可采信证据结果未知（#${last.evidence_id}），未知不记过`],
     };
+  }
+
+  // v4：可选的「独立复核」门禁。**默认关闭**（require_independent_review 缺省 0），
+  // 老任务走不到这段，行为与 v3 逐字节一致。
+  // 打开后要求：最后一条可采信证据有复核人，且复核人**不是**报证据的人。
+  // 为什么比的是 evidence.actor 而不是"谁来调 complete"：自验自报的漏洞在**证据本身**，
+  // 不在最后点按钮的那个人 —— 换个人点完成并不能让一条自证变独立。
+  if (Number(task.require_independent_review ?? 0) === 1) {
+    const verifier = typeof last.verified_by === 'string' ? last.verified_by.trim() : '';
+    if (verifier.length === 0) {
+      return {
+        allowed: false,
+        reasons: [
+          `INDEPENDENT_REVIEW_REQUIRED: 该任务要求独立复核，但最后一条可采信证据（#${last.evidence_id}）没有 verified_by（谁验的）`,
+        ],
+      };
+    }
+    if (verifier === String(last.actor ?? '').trim()) {
+      return {
+        allowed: false,
+        reasons: [
+          `INDEPENDENT_REVIEW_REQUIRED: 该任务要求独立复核，但证据（#${last.evidence_id}）的复核人就是上报人（${verifier}），属于自验自报`,
+        ],
+      };
+    }
   }
 
   return { allowed: true, reasons: [] };

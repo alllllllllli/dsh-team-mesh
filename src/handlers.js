@@ -254,6 +254,9 @@ export function createHandlers(deps) {
         `  task_id: ${task.task_id}`,
         `  ${task.title}`,
         `  状态：${lifecycleLabel(task.lifecycle)}`,
+        ...(task.require_independent_review === 1
+          ? ['  独立复核：已开启（完成时须有一条 verifiedBy ≠ 上报人的可采信证据）']
+          : []),
         '',
         '下一步：mesh_dispatch 派给别人，或自己 mesh_task_claim 后再动手。',
       ].join('\n');
@@ -365,6 +368,11 @@ export function createHandlers(deps) {
           outcome: args?.outcome,
           note: args?.note,
           evidenceRef: args?.evidenceRef,
+          // v4：结构化复核字段（全部可选，不传即 NULL，老行为不变）
+          verifiedBy: args?.verifiedBy,
+          verifiedAt: args?.verifiedAt,
+          acceptanceRef: args?.acceptanceRef,
+          verificationMethod: args?.verificationMethod,
         },
         actor,
       );
@@ -372,6 +380,19 @@ export function createHandlers(deps) {
         `已记录证据 #${res.evidence_id}（task ${taskId}）`,
         `  可采信：${res.admissible ? '是' : '否'}`,
       ];
+      // v4：复核信息回显 —— 让"谁验的、验的哪条"当场可见，不用去查库
+      if (res.verified_by !== null && res.verified_by !== undefined) {
+        const same = String(res.verified_by).trim() === String(actor).trim();
+        lines.push(
+          `  复核人：${res.verified_by}${same ? '（与上报人相同 —— 这是自验自报，独立复核门禁会拒）' : '（与上报人不同，可满足独立复核）'}`,
+        );
+        if (res.acceptance_ref !== null && res.acceptance_ref !== undefined) {
+          lines.push(`  对应验收条目：${res.acceptance_ref}`);
+        }
+        if (res.verification_method !== null && res.verification_method !== undefined) {
+          lines.push(`  复核方式：${res.verification_method}`);
+        }
+      }
       if (!res.admissible) {
         lines.push('  因为：');
         for (const r of res.reasons) lines.push(`    - ${r}`);
