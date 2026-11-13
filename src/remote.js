@@ -20,10 +20,24 @@ import http from 'node:http';
 import https from 'node:https';
 import path from 'node:path';
 
-import { TeamError } from './domain.js';
+import { processIdentity, TeamError } from './domain.js';
 import { blobRef, isBlobRef, parseRef } from './refs.js';
 
 const DEFAULT_TIMEOUT_MS = 10000;
+
+/**
+ * v4：本进程的租约身份 —— **调用方进程**的 pid / 进程启动秒 / 主机名。
+ *
+ * 方向必须搞清楚：RemoteBoard 跑在**调用方机器**上，所以这里要报的是调用方的身份。
+ * 板服务是长驻单例，它看不到调用方的 pid；如果让它拿自己的 pid 顶替，板服务一重启
+ * 所有在跑的租约就全被判成 PID 复用（见 src/server.js 的 readIdentity 注释）。
+ *
+ * 为什么在模块加载时只算一次：`start_sec` 是 `Date.now() - uptime*1000` 反推的，
+ * 两次调用之间若恰好跨过整秒边界，`Math.floor` 会差 1 —— claim 与 heartbeat 报出
+ * 两个不同的 startSec，就会被板服务误判成 PID_REUSED（假阳性）。身份在一个进程的
+ * 生命周期内本来就不变，算一次、到处用，既更准也更省。
+ */
+const PROCESS_LEASE_IDENTITY = Object.freeze(processIdentity());
 
 class BoardHttpError extends TeamError {}
 
@@ -114,6 +128,20 @@ export class RemoteBoard {
     return h;
   }
 
+  /**
+   * v4：随 claim / heartbeat 上报的**调用方**租约身份。
+   *
+   * 与板服务 src/server.js 的 `readIdentity(body)` 一一对应：它读 `body.leaseIdentity`
+   * 的 `pid` / `start_sec` / `host` 三项，任何一项缺失或类型不对就整条不采信。
+   * 所以这里返回的字段名必须与它严格一致（`start_sec` 下划线，不是 `startSec`）。
+   *
+   * 返回副本而不是共享对象：调用方若改了返回值，不能污染本进程的身份常量。
+   * @returns {{pid:number, start_sec:number, host:string|null}}
+   */
+  leaseIdentity() {
+    return { ...PROCESS_LEASE_IDENTITY };
+  }
+
   async call(method, p, { query, body } = {}) {
     const u = this.url(p, query);
     const opts = { method, headers: this.headers(), timeoutMs: this.timeoutMs };
@@ -174,7 +202,15 @@ export class RemoteBoard {
   }
 
   async claimTask(taskId, actor, opts = {}) {
-    const r = await this.call('POST', '/task/claim', { body: { taskId, actor, leaseMs: opts?.leaseMs } });
+    const r = await this.call('POST', '/task/claim', {
+      body: {
+        taskId,
+        actor,
+        leaseMs: opts?.leaseMs,
+        // v4：让板服务记下**本进程**（调用方）的身份，而不是它自己的 pid。
+        leaseIdentity: this.leaseIdentity(),
+      },
+    });
     return { task: r.task, deduped: r.deduped === true };
   }
 
@@ -322,7 +358,14 @@ export class RemoteBoard {
 
   async heartbeat(taskId, actor, opts = {}) {
     const r = await this.call('POST', '/task/heartbeat', {
-      body: { taskId, actor, leaseMs: opts?.leaseMs },
+      body: {
+        taskId,
+        actor,
+        leaseMs: opts?.leaseMs,
+        // v4：续租时板服务拿它跟 claim 时记下的 pid/startSec 比对；
+        // 对不上就回 PID_REUSED —— 这正是「PID 被系统复用」在 HTTP 路径上的落点。
+        leaseIdentity: this.leaseIdentity(),
+      },
     });
     return { task: r.task, was_stale: r.was_stale === true };
   }
