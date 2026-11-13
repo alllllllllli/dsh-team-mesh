@@ -22,7 +22,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { eventPayload } from './domain.js';
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -42,7 +42,11 @@ CREATE TABLE IF NOT EXISTS task (
   request_id    TEXT UNIQUE,
   version       INTEGER NOT NULL DEFAULT 1,
   created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL
+  updated_at    INTEGER NOT NULL,
+  -- v4：租约身份（防 PID 复用）。三个都可空 —— 老数据为 NULL 时行为与 v3 完全一致。
+  lease_pid               INTEGER,
+  lease_start_sec         INTEGER,
+  lease_host              TEXT
 );
 
 CREATE TABLE IF NOT EXISTS evidence (
@@ -177,6 +181,25 @@ const TASK_V2_COLUMNS = [
   ['stale_at', 'INTEGER'],
 ];
 
+/**
+ * v4 给 task 表追加的列 —— **租约身份 + 可选独立复核门禁**。
+ *
+ * 为什么要有 lease_pid / lease_start_sec：v2/v3 的租约只靠 `lease_owner`（一个字符串）
+ * 加 `lease_until`（时间戳）。进程崩了、系统把同一个 PID 复用给别的进程后，
+ * 光看"负责人名字对不对"无法分辨"还是那个进程"和"PID 被复用给了另一个进程"。
+ * 加上 pid + 进程启动时刻（秒），就能在同一台机器上判定"持有者还是不是当初那个进程"。
+ *
+ * 为什么三个都可空：**老数据零影响**。NULL 表示"这条租约没有身份信息"，
+ * 所有校验遇到 NULL 一律跳过，行为与 v3 逐字节一致。
+ *
+ * lease_host：跨机器时 pid 无意义（不同机器 pid 空间独立，同号纯属巧合），
+ * 所以只有 lease_host 与本机相同才验 pid；不同机器只认时间。
+ */
+const TASK_V4_COLUMNS = [
+  ['lease_pid', 'INTEGER'],
+  ['lease_start_sec', 'INTEGER'],
+  ['lease_host', 'TEXT'],
+];
 
 export class LocalSqliteBackend {
   constructor(dbPath) {
@@ -193,6 +216,7 @@ export class LocalSqliteBackend {
     // 所以按 PRAGMA table_info 逐个判断，可反复执行（幂等）。
     this.migrateTaskV2();
     this.migrateDispatchV3();
+    this.migrateTaskV4();
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
     if (row === undefined) {
       this.db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
@@ -223,6 +247,31 @@ export class LocalSqliteBackend {
     if (!existing.has('created_session')) {
       this.db.exec('ALTER TABLE dispatch ADD COLUMN created_session INTEGER NOT NULL DEFAULT 0');
     }
+  }
+
+  /**
+   * 通用补列：按 PRAGMA table_info 判断列是否存在，缺了才 ALTER。
+   *
+   * **幂等**是硬要求：这个方法在每次打开库时都会跑（板服务每次启动、
+   * 每个测试用例建库时都跑），重复执行必须是空操作，不报错、不写数据。
+   * @returns {string[]} 本次实际补上的列名（已存在的不算）
+   */
+  addColumnsIfMissing(table, columns) {
+    const existing = new Set(
+      this.db.prepare(`PRAGMA table_info(${table})`).all().map((c) => String(c.name)),
+    );
+    const added = [];
+    for (const [name, decl] of columns) {
+      if (existing.has(name)) continue;
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${decl}`);
+      added.push(name);
+    }
+    return added;
+  }
+
+  /** v4 迁移：task 表补租约身份列 + 独立复核开关。幂等，老行一律 NULL / 0。 */
+  migrateTaskV4() {
+    return this.addColumnsIfMissing('task', TASK_V4_COLUMNS);
   }
 
   close() {
@@ -534,6 +583,23 @@ export class LocalSqliteBackend {
       .prepare(
         `SELECT * FROM task WHERE lease_until IS NOT NULL AND lease_until <= ?
            AND stale = 0 AND lifecycle NOT IN ('done','canceled')`,
+      )
+      .all(now);
+  }
+
+  /**
+   * v4：所有"租约**还没到期**、但有身份信息、且尚未标 stale"的任务。
+   *
+   * 为什么单独一条查询而不是把所有活跃任务都拉出来：这张表在真机上会一直长，
+   * 每秒扫全表只为了看几十个活跃租约不值。`lease_pid IS NOT NULL` 直接把
+   * 老数据（v3 及以前、无身份）排除掉 —— 老租约只走时间判定，行为不变。
+   */
+  queryLiveLeases(now) {
+    return this.db
+      .prepare(
+        `SELECT * FROM task WHERE lease_until IS NOT NULL AND lease_until > ?
+           AND lease_pid IS NOT NULL AND stale = 0
+           AND lifecycle NOT IN ('done','canceled')`,
       )
       .all(now);
   }

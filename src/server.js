@@ -156,7 +156,14 @@ function makeRoutes(board) {
     }),
 
     'POST /task/claim': (_ctx, _p, body) => {
-      const res = board.claimTask(body.taskId, body.actor ?? 'unknown', { leaseMs: body.leaseMs });
+      const res = board.claimTask(body.taskId, body.actor ?? 'unknown', {
+        leaseMs: body.leaseMs,
+        // v4：租约身份。**必须由客户端报自己的 pid**，不能用板服务的 pid ——
+        // 板服务是长驻单例，它一重启就会把所有在跑的租约误判成 PID 复用。
+        // 客户端没报（当前 remote.js 就是这样，本次冻结不动它）→ null = 不知道，
+        // 板服务如实记 NULL，所有校验跳过，行为与 v3 完全一致。
+        identity: readIdentity(body),
+      });
       return { ok: true, ...res };
     },
 
@@ -196,7 +203,11 @@ function makeRoutes(board) {
     },
 
     'POST /task/heartbeat': (_ctx, _p, body) => {
-      const res = board.heartbeat(body.taskId, body.actor ?? 'unknown', { leaseMs: body.leaseMs });
+      const res = board.heartbeat(body.taskId, body.actor ?? 'unknown', {
+        leaseMs: body.leaseMs,
+        // v4：同上，身份由客户端报；没报就是 null（不知道）→ 不校验
+        identity: readIdentity(body),
+      });
       return { ok: true, ...res };
     },
 
@@ -302,6 +313,35 @@ function makeRoutes(board) {
  *
  * 任何新加的 POST 一律不在表里 —— 漏写只会更严，不会更松。
  */
+/**
+ * v4：从请求体里读「调用方的租约身份」。
+ *
+ * 为什么身份必须由**调用方**报，不能由板服务自己填：板服务是长驻单例，
+ * claim/heartbeat 是代客户端执行的。如果板服务把自己的 pid 记成持有者，
+ * 那么板服务一重启，所有正在跑的租约的 pid 就都对不上了，客户端心跳会被
+ * 一律判成 PID_REUSED —— 一个重启就让整个集群的租约全部失效。
+ *
+ * 返回：
+ *   null  —— 客户端没报、或报得不完整。**这是当前 remote.js 的实际情形**
+ *            （本次冻结不动它），于是板服务如实记 NULL，所有校验跳过，
+ *            行为与 v3 逐字节一致。
+ *   对象  —— 客户端报了 pid + start_sec + host 三项，逐项校验后才采信。
+ *
+ * 校验从严：任何一项缺失或类型不对，整条身份都不采信（退化为 null）。
+ * 半个身份比没有身份更危险 —— 拿 pid 却不知道是哪台机器的 pid，会把跨机器租约误判。
+ */
+function readIdentity(body) {
+  const raw = body?.leaseIdentity;
+  if (raw === null || raw === undefined || typeof raw !== 'object') return null;
+  const pid = Number(raw.pid);
+  const startSec = Number(raw.start_sec ?? raw.startSec);
+  const host = raw.host === null || raw.host === undefined ? null : String(raw.host);
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  if (!Number.isInteger(startSec) || startSec <= 0) return null;
+  if (host === null || host.length === 0) return null;
+  return { pid, start_sec: startSec, host };
+}
+
 const READ_ONLY_ROUTES = new Set([
   'GET /health',
   'GET /task/list',

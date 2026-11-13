@@ -27,9 +27,13 @@ import {
   DEFAULT_ACK_TIMEOUT_MS,
   DEFAULT_LEASE_MS,
   DEFAULT_SESSION_REQUEST_TTL_MS,
+  defaultIsPidAlive,
   evaluateCompletion,
+  leaseHolderIsDead,
+  leaseIdentityMatches,
   leaseIsLive,
   OUTCOMES,
+  processIdentity,
   TERMINAL,
   TeamError,
 } from './domain.js';
@@ -174,10 +178,16 @@ export class Board {
    * 为什么必须有租约：v1 里"被认领后死掉的任务会一直挂在 working"，
    * 发起方永远不知道对端是挂了还是还在干。租约让"它还活着吗"变成一个可判定的事实。
    *
-   * @param {{leaseMs?:number}} [opts]
+   * v4 起租约还带**持有者身份**（pid + 进程启动秒 + 主机名），见 leaseIdentityMatches。
+   * 认领时记下本进程身份，心跳时校验它 —— 这样 PID 被系统复用后不会把租约
+   * 悄悄续给一个陌生进程。
+   *
+   * @param {{leaseMs?:number, identity?:{pid:number,start_sec:number,host:string|null}}} [opts]
    */
   claimTask(taskId, actor, opts = {}) {
     const leaseMs = Number(opts?.leaseMs ?? DEFAULT_LEASE_MS);
+    // v4：身份三态，见 resolveIdentity。undefined=本进程（本地直连），null=不知道（HTTP），对象=调用方指定。
+    const identity = resolveIdentity(opts?.identity);
     return this.tx(() => {
       const row = this.backend.readTaskRow(taskId);
       if (row === undefined || row === null) throw new TeamError('TASK_NOT_FOUND', `任务不存在：${taskId}`);
@@ -192,6 +202,9 @@ export class Board {
         this.backend.updateTaskCas(taskId, task.version, {
           lease_owner: actor,
           lease_until: now + leaseMs,
+          lease_pid: identity.pid,
+          lease_start_sec: identity.start_sec,
+          lease_host: identity.host,
           stale: 0,
           stale_at: null,
         });
@@ -214,6 +227,9 @@ export class Board {
           from: task.owner_session,
           reason: verdict.why,
           stale: task.stale === 1,
+          // v4：把原租约身份一并留痕，事后能判断"是时间到期"还是"进程已换人"
+          prev_lease_pid: task.lease_pid ?? null,
+          prev_lease_start_sec: task.lease_start_sec ?? null,
         });
       }
 
@@ -224,6 +240,9 @@ export class Board {
         owner_session: actor,
         lease_owner: actor,
         lease_until: now + leaseMs,
+        lease_pid: identity.pid,
+        lease_start_sec: identity.start_sec,
+        lease_host: identity.host,
         stale: 0,
         stale_at: null,
       });
@@ -237,9 +256,21 @@ export class Board {
     });
   }
 
-  /** 心跳续租。只有当前 owner 能续；过期了也能续回（但会记一次 stale→live）。 */
+  /**
+   * 心跳续租。只有当前 owner 能续；过期了也能续回（但会记一次 stale→live）。
+   *
+   * v4：续租前先校验**持有者身份**。同一个 pid 但进程启动时刻不同 → `PID_REUSED`。
+   * 这是"防 PID 复用"的核心：进程崩了之后，系统可能把同一个 pid 分给别的进程；
+   * 那个新进程如果拿着旧的 owner 名字来续租，会把一条本该 stale 的租约续活，
+   * 于是发起方永远等不到"负责人已死"这个结论。拒绝续租让租约如实过期。
+   *
+   * 拒绝原因分两种，语义不同：
+   *   PID_REUSED  —— 身份对不上（同机才可能判定），明确是"换了进程"
+   *   NOT_LEASE_OWNER —— 名字就不对，v3 已有行为，保持不变
+   */
   heartbeat(taskId, actor, opts = {}) {
     const leaseMs = Number(opts?.leaseMs ?? DEFAULT_LEASE_MS);
+    const identity = resolveIdentity(opts?.identity);
     return this.tx(() => {
       const row = this.backend.readTaskRow(taskId);
       if (row === undefined || row === null) throw new TeamError('TASK_NOT_FOUND', `任务不存在：${taskId}`);
@@ -253,11 +284,26 @@ export class Board {
           `你不是这个任务的负责人（当前 ${task.owner_session ?? '无人'}），不能续租`,
         );
       }
+      // v4：身份校验。老数据（lease_pid 为 NULL）在这里必然 ok=true，行为不变。
+      const ident = leaseIdentityMatches(task, identity);
+      if (!ident.ok) {
+        throw new TeamError(
+          'PID_REUSED',
+          `租约持有者身份对不上（${ident.reason}），拒绝续租：` +
+            `记录的 pid/startSec=${JSON.stringify(task.lease_pid)}/${JSON.stringify(task.lease_start_sec)}，` +
+            `本进程=${identity.pid}/${identity.start_sec}。` +
+            '这通常意味着原进程已退出、PID 被系统复用。请让原负责人重新 claim。',
+          ident.detail,
+        );
+      }
       const now = Date.now();
       const wasStale = task.stale === 1;
       const ok = this.backend.updateTaskCas(taskId, task.version, {
         lease_owner: actor,
         lease_until: now + leaseMs,
+        lease_pid: identity.pid,
+        lease_start_sec: identity.start_sec,
+        lease_host: identity.host,
         stale: 0,
         stale_at: null,
       });
@@ -272,25 +318,64 @@ export class Board {
   /**
    * 扫描所有过期租约，标 stale 并留痕。**幂等**，可以被反复调用。
    * 这是"它挂了发起方立刻知道"的实现：不需要对端说话，扫描就能发现。
+   *
+   * v4 起额外判「持有者已死」：租约**时间还没到**，但同机上记录的进程已经不在了，
+   * 这条租约同样应该判 stale —— 否则要白等到期（最长 10 分钟）才有人能接手。
+   *
+   * 为什么这个判定必须**跨机器只认时间**：`lease_pid` 是本机的 pid 空间里的号，
+   * 另一台机器上同号的进程纯属巧合。拿本地 pid 存活表去判远端租约，
+   * 会随机把"远端还活着"判成"死了"，把租约抢过来 —— 这比不做判定更糟。
+   * 所以只有 `lease_host` 与本机相同（或两边都没有主机名、退化为同机）才验 pid。
    */
-  sweepStaleLeases(now = Date.now()) {
+  sweepStaleLeases(now = Date.now(), opts = {}) {
+    // 扫描者身份同样是三态：本进程（默认）/ null=不知道 / 显式对象
+    const identity = resolveIdentity(opts?.identity);
+    // 测试可注入「哪些 pid 算活着」；默认用真实的 process.kill(pid, 0)
+    const isPidAlive = typeof opts?.isPidAlive === 'function' ? opts.isPidAlive : defaultIsPidAlive;
     return this.tx(() => {
-      const rows = this.backend.queryExpiredLeases(now);
+      // 先捞「时间已过期」的，再捞「时间没到但持有者已死」的，两者都要判
+      const expired = this.backend.queryExpiredLeases(now);
+      const seen = new Set(expired.map((r) => String(r.task_id)));
+      const deadOwner = [];
+      // 扫描者不知道自己在哪台机器上时（identity 全 null），一律不判死：
+      // 无法区分"同机"和"跨机器"，就不能用 pid 存活表下结论。
+      const canJudgePid = identity !== null && identity.pid !== null && identity.host !== null;
+      if (canJudgePid) {
+        for (const row of this.backend.queryLiveLeases(now)) {
+          if (seen.has(String(row.task_id))) continue;
+          const task = this.rowToTask(row);
+          const verdict = leaseHolderIsDead(task, identity, isPidAlive);
+          if (verdict.dead) deadOwner.push({ row, task, verdict });
+        }
+      }
+
       const marked = [];
-      for (const row of rows) {
-        const task = this.rowToTask(row);
+      const markOne = (task, extra) => {
         const ok = this.backend.updateTaskCas(task.task_id, task.version, {
           stale: 1,
           stale_at: now,
         });
-        if (!ok) continue;
+        if (!ok) return;
         this.appendEvent('lease.stale', task.task_id, task.owner_session, {
           lease_until: task.lease_until,
           overrun_ms: typeof task.lease_until === 'number' ? now - task.lease_until : null,
+          ...extra,
         });
         marked.push(task.task_id);
+      };
+
+      for (const row of expired) {
+        markOne(this.rowToTask(row), {});
       }
-      return { marked, count: marked.length };
+      for (const { task, verdict } of deadOwner) {
+        markOne(task, {
+          // 与"时间到期"区分开：审计里能看出这次是因为持有者进程没了才判 stale
+          reason: verdict.reason,
+          lease_pid: task.lease_pid ?? null,
+          lease_start_sec: task.lease_start_sec ?? null,
+        });
+      }
+      return { marked, count: marked.length, expired_count: expired.length, dead_owner_count: deadOwner.length };
     });
   }
 
@@ -300,6 +385,16 @@ export class Board {
    * 关键：**引用解析在写事务之外**（要读盘或读 blob，不该占写锁），
    * 判定结果（admissible/reasons/sha256）随之定死，然后才进事务落库。
    * 落库时只写"已经算好的事实"，事务里不再做 IO。
+   *
+   * v4：额外接受四个**可选**的结构化复核字段：
+   *   verifiedBy          谁复核的（允许与 actor 不同 —— 这正是它的意义）
+   *   verifiedAt          复核时间（缺省用本刻）
+   *   acceptanceRef       对应 acceptance 里的哪一条（如 A03）
+   *   verificationMethod  disk-hash / manual-review / test-run（白名单）
+   * 全部缺省 → 四个字段写 NULL，与 v3 行为一致，老调用方一个字都不用改。
+   *
+   * @param {object} input 见上；`executed`/`outcome`/`evidenceRef` 是 v3 就有的
+   * @param {string} actor 上报人（写进 evidence.actor，门禁判"自验自报"时与 verified_by 比）
    */
   reportEvidence(taskId, input, actor) {
     const executed = input.executed === true;
@@ -572,9 +667,9 @@ export class Board {
   }
 
   /** 把"过期的 ack 与租约"一起扫。inject 之前调用，保证注入的是最新真相。 */
-  sweepAll(now = Date.now()) {
+  sweepAll(now = Date.now(), opts = {}) {
     const ack = this.sweepAckTimeouts(now);
-    const lease = this.sweepStaleLeases(now);
+    const lease = this.sweepStaleLeases(now, opts);
     const sessionRequest = this.sweepSessionRequests(now);
     return { ack, lease, session_request: sessionRequest };
   }
@@ -709,8 +804,41 @@ export class Board {
       lease_until: row.lease_until === null || row.lease_until === undefined ? null : Number(row.lease_until),
       stale: Number(row.stale ?? 0),
       stale_at: row.stale_at === null || row.stale_at === undefined ? null : Number(row.stale_at),
+      // v4：租约身份（老数据一律 null）+ 独立复核开关（老数据一律 0）
+      lease_pid: row.lease_pid === null || row.lease_pid === undefined ? null : Number(row.lease_pid),
+      lease_start_sec: row.lease_start_sec === null || row.lease_start_sec === undefined
+        ? null
+        : Number(row.lease_start_sec),
+      lease_host: row.lease_host ?? null,
     };
   }
+}
+
+/**
+ * 「不知道持有者身份」的显式表示（pid / startSec / host 全 null）。
+ *
+ * 为什么要区分「不知道」和「本进程」：
+ * 走 HTTP 的板（RemoteBoard）里，claim/heartbeat 实际执行在**板服务进程**中。
+ * 板服务根本看不到调用方 agent 的 pid —— 它只能看到自己的。如果这时把
+ * "板服务自己的 pid" 当成持有者身份记下来，会带来两个真实故障：
+ *   1. 板服务一重启，所有在跑的租约都被判成 PID 复用，agent 心跳被拒、任务被抢；
+ *   2. 同一台板上多个 agent 的租约挤在同一个 pid 上，区分能力等于零。
+ * 所以「客户端没告诉我它是谁」时，如实记 NULL —— 与 v3 老数据完全同构，
+ * 所有校验遇到 NULL 一律跳过（见 leaseIdentityMatches / leaseHolderIsDead）。
+ * 这正是任务要求的「跨机器只认时间」在代码里的落点。
+ */
+export const UNKNOWN_IDENTITY = Object.freeze({ pid: null, start_sec: null, host: null });
+
+/**
+ * 把 `opts.identity` 归一成三态：
+ *   undefined → 本进程（本地 SQLite 直连路径，守卫真正生效的地方）
+ *   null      → 不知道（HTTP 路径，如实记 NULL）
+ *   对象      → 调用方指定（远端将来带上 pid 时，或测试注入）
+ */
+function resolveIdentity(identity) {
+  if (identity === null) return UNKNOWN_IDENTITY;
+  if (identity === undefined) return processIdentity();
+  return identity;
 }
 
 function safeParse(text) {

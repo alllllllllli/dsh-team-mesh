@@ -11,12 +11,18 @@
  *   3. 只有部分证据可采信 → 按可采信的最后一条判；不可采信的不参与
  *   4. 可采信的 fail 或 unknown → 不能完成
  *   5. admissible 由**代码**算，不由模型自报（模型只能给 executed/outcome/说明）
+ *
+ * 唯一的外部依赖是 `node:os` 的 hostname()：v4 的租约身份校验需要知道"这台机器是谁"
+ * 才能决定要不要验 pid（跨机器 pid 无意义）。它是纯读、无副作用、结果缓存；
+ * 而且所有判定函数都接受显式传入的 identity，测试不需要真的读系统。
  */
+import os from 'node:os';
 
 export const LIFECYCLES = ['open', 'claimed', 'working', 'blocked', 'done', 'canceled'];
 export const OUTCOMES = ['pass', 'fail', 'unknown'];
 /** 终态：不能再改，也不能再报证据。 */
 export const TERMINAL = new Set(['done', 'canceled']);
+
 
 export class TeamError extends Error {
   constructor(code, message, detail) {
@@ -117,6 +123,7 @@ export function evaluateCompletion(task, evidences) {
       reasons: [`LATEST_UNKNOWN: 最后一条可采信证据结果未知（#${last.evidence_id}），未知不记过`],
     };
   }
+
   return { allowed: true, reasons: [] };
 }
 
@@ -257,6 +264,149 @@ export function leaseIsLive(task, now) {
   if (task === null || task === undefined) return false;
   if (typeof task.lease_until !== 'number') return false;
   return task.lease_until > now;
+}
+
+/**
+ * v4：本进程的租约身份 —— pid + 进程启动时刻（秒）+ 主机名。
+ *
+ * 为什么要有 startSec：PID 会被系统复用。进程崩掉后，同一个 pid 可能落到
+ * 一个完全无关的新进程上；只看 pid 相等就续租，等于把租约交给了一个陌生进程。
+ * 进程启动时刻是 pid 之外唯一便宜的区分手段，两者一起才够。
+ *
+ * startSec 用 `Date.now() - process.uptime()*1000` 反推（Node 没有直接暴露启动时间），
+ * 取秒级：毫秒级在同一秒内重启的极端场景下也不可靠，秒级已经足够区分"同一个进程"。
+ *
+ * @returns {{pid:number, start_sec:number, host:string|null}}
+ */
+export function processIdentity() {
+  const upMs = typeof process.uptime === 'function' ? process.uptime() * 1000 : 0;
+  return {
+    pid: typeof process.pid === 'number' ? process.pid : 0,
+    start_sec: Math.floor((Date.now() - upMs) / 1000),
+    host: hostnameOrNull(),
+  };
+}
+
+let cachedHostname;
+function hostnameOrNull() {
+  if (cachedHostname !== undefined) return cachedHostname;
+  try {
+    cachedHostname = os.hostname() || null;
+  } catch {
+    cachedHostname = null;
+  }
+  return cachedHostname;
+}
+
+/**
+ * v4：判断一条租约记录的「持有者身份」是否还属于**当前这个进程**。
+ *
+ * 三条判定，全部只做**同机**比对：
+ *   1. lease_pid 为空 → `{ ok: true, reason: 'no-identity' }`
+ *      **老数据（v3 及以前）走这条**：没有身份信息就没有可校验的东西，
+ *      一律放行，行为与改前完全一致。这是「新字段可空、老数据零影响」的落点。
+ *   2. lease_host 存在且与本机不同 → `{ ok: true, reason: 'other-host' }`
+ *      跨机器 pid 无意义（两台机器各有 pid 1，纯属巧合），只认时间，不验 pid。
+ *   3. 同机：pid 或 startSec 不符 → `{ ok: false, reason: 'pid-reused' }`
+ *
+ * @param {object} task 任务行（含 v4 的租约身份字段）
+ * @param {{pid:number,start_sec:number,host:string|null}} [identity] 默认取本进程
+ * @returns {{ok:boolean, reason:string, detail?:object}}
+ */
+export function leaseIdentityMatches(task, identity) {
+  const me = identity ?? processIdentity();
+  if (task === null || task === undefined) return { ok: true, reason: 'no-task' };
+
+  const pid = task.lease_pid === null || task.lease_pid === undefined ? null : Number(task.lease_pid);
+  // 老数据：没有 pid 就没有身份可比 —— 放行（零影响）
+  if (pid === null) return { ok: true, reason: 'no-identity' };
+
+  const leaseHost = task.lease_host === null || task.lease_host === undefined ? null : String(task.lease_host);
+  if (leaseHost !== null && me.host !== null && leaseHost !== me.host) {
+    // 跨机器：pid 不可比，只认时间（时间校验在调用方）
+    return { ok: true, reason: 'other-host' };
+  }
+
+  const startSec = task.lease_start_sec === null || task.lease_start_sec === undefined
+    ? null
+    : Number(task.lease_start_sec);
+  if (pid !== me.pid) {
+    return { ok: false, reason: 'pid-reused', detail: { lease_pid: pid, my_pid: me.pid } };
+  }
+  if (startSec !== null && startSec !== me.start_sec) {
+    // 同一个 pid、不同的进程启动时刻 → PID 被系统复用给了别的进程
+    return { ok: false, reason: 'pid-reused', detail: { lease_start_sec: startSec, my_start_sec: me.start_sec } };
+  }
+  return { ok: true, reason: 'same-process' };
+}
+
+/**
+ * v4：判断一条租约的持有者进程是否**已经死了**（用于"时间还没到也要判 stale"）。
+ *
+ * 判定规则（与 leaseIdentityMatches 保持同一套边界）：
+ *   - 没有 lease_pid（老数据）→ 不判死。没有身份信息就不该凭空判死，只认时间。
+ *   - lease_host 与本机不同 → 不判死。**跨机器只认时间**，拿本地 pid 存活表判远端
+ *     租约会随机把"远端还活着"判成死了，从而抢走别人的活。这比不做判定更糟。
+ *   - 同机且 pid 就是本进程 → 不判死（自己不会杀自己）。
+ *   - 同机且 pid 不是本进程 → 交给 isPidAlive 判；不在 = 死了。
+ *     如果 startSec 与本进程不符但 pid 号恰好等于本进程 pid，也算"别人"，
+ *     因为进程启动时刻不同 —— 那是被复用给我们的一个**旧**记录，不是我们持有的。
+ *
+ * @param {object} task 任务行
+ * @param {{pid:number,start_sec:number,host:string|null}} identity 判定者身份（默认本进程）
+ * @param {(pid:number)=>boolean} isPidAlive 注入的存活探测（测试用假实现）
+ * @returns {{dead:boolean, reason:string}}
+ */
+export function leaseHolderIsDead(task, identity, isPidAlive) {
+  if (task === null || task === undefined) return { dead: false, reason: 'no-task' };
+  const pid = task.lease_pid === null || task.lease_pid === undefined ? null : Number(task.lease_pid);
+  if (pid === null) return { dead: false, reason: 'no-identity' };
+
+  const me = identity ?? processIdentity();
+  const leaseHost = task.lease_host === null || task.lease_host === undefined ? null : String(task.lease_host);
+  if (leaseHost !== null && me.host !== null && leaseHost !== me.host) {
+    return { dead: false, reason: 'other-host' };
+  }
+
+  const startSec = task.lease_start_sec === null || task.lease_start_sec === undefined
+    ? null
+    : Number(task.lease_start_sec);
+  // 同机且身份完全就是本进程：它活着（就是我）
+  if (pid === me.pid && (startSec === null || startSec === me.start_sec)) {
+    return { dead: false, reason: 'self' };
+  }
+
+  const probe = typeof isPidAlive === 'function' ? isPidAlive : defaultIsPidAlive;
+  let alive;
+  try {
+    alive = probe(pid) === true;
+  } catch {
+    // 探测本身失败不能当成"死了"——宁可少判，不可误判（误判会抢走别人的活）
+    return { dead: false, reason: 'probe-error' };
+  }
+  if (!alive) return { dead: true, reason: 'holder-pid-gone' };
+  // pid 还在，但启动时刻不符：这是被复用的 pid，原持有者已经没了
+  if (startSec !== null && pid === me.pid && startSec !== me.start_sec) {
+    return { dead: true, reason: 'holder-pid-reused' };
+  }
+  return { dead: false, reason: 'holder-alive' };
+}
+
+/**
+ * 默认的 pid 存活探测：`process.kill(pid, 0)` 不发信号，只做权限/存在性检查。
+ * EPERM 表示进程存在但属于别人 —— **算活着**（这是最容易写错的一处：
+ * 把"没权限杀"当成"已经死了"，会把别人的活抢过来）。
+ */
+export function defaultIsPidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (err) {
+    if (err !== null && typeof err === 'object' && err.code === 'EPERM') return true;
+    return false;
+  }
 }
 
 /**
