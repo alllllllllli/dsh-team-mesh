@@ -25,7 +25,23 @@ export const TOOL_NAMES = {
   ack: 'mesh_task_ack',
   heartbeat: 'mesh_task_heartbeat',
   inbox: 'mesh_inbox',
+  // 0.4：三证据收养（比 claim 更安全的 stale 接管路径）
+  adopt: 'mesh_task_adopt',
 };
+
+/**
+ * `newSession` 派发的**回执窗口**强制下限：180s。
+ *
+ * 关键区分（这是本轮最容易做错的地方）：
+ *   - **建会话等待**：等对端把会话建出来。轮询周期 3s、旧默认 60s 本来就够 → **不受这个下限影响**。
+ *   - **回执窗口**：等对面新会话的模型起跑并 ack。实测一次要 99s → 60s 必然误判成 ack_timeout。
+ * 所以下限只抬回执窗口，且只在 `newSession=true` 时生效；显式给的更大值仍然生效。
+ * 配置项 `newSessionAckFloorMs` 可覆盖（默认就是这里的 180000）。
+ *
+ * 常量放在 spec 而不是 handlers：这段说明是模型可见契约，取值与说明必须同源，
+ * 否则改了代码忘了改文案，模型会按错的时限去等。
+ */
+export const NEW_SESSION_ACK_FLOOR_MS = 180_000;
 
 const textOut = {
   schema: { type: 'string' },
@@ -121,6 +137,50 @@ export function claimSpec() {
   };
 }
 
+export function adoptSpec() {
+  return {
+    name: TOOL_NAMES.adopt,
+    description: [
+      '**三证据收养**：在一个任务的租约已经失效（stale 或已过期）后，用比 claim 更严的证据接管它。',
+      '',
+      '为什么需要它：claim 只要"过期/stale"就能抢 —— 但那只能证明"它没续租"，证明不了',
+      '"原持有者真的死了"，也证明不了"过期后没有别人续过租"。adopt 要求三类证据**同时成立**：',
+      '  E1 时间：lease_until 已过期，或任务已被扫描标记 stale（payload 记 overrun_ms）；',
+      '  E2 身份：**只有板服务与租约持有者在同一台机器上时才可能验 pid**',
+      '           （os.hostname() == lease_host，且记录里有 pid）。同机会判 pid 是否还存在 /',
+      '           是否被复用；跨机、记录缺身份、判定者不知道自己在哪台机器 —— 一律标 `unverified`，',
+      '           **绝不把未验证写成已验证**（两台机器各有 pid 1，跨机验 pid 是伪命题）。',
+      '  E3 事件：该任务最后一条租约类事件（claim / renew / heartbeat / revived）必须早于',
+      '           lease_until，且 lease_until 之后没有任何续租痕迹。',
+      '',
+      '拒绝码（稳定，按码分流）：',
+      '  ADOPT_NOT_STALE            时间证据不成立（租约还在有效期内且未 stale）',
+      '  ADOPT_HOLDER_ALIVE         同机确认持有者进程还活着 —— 该让它 heartbeat，不是抢',
+      '  ADOPT_EVIDENCE_INSUFFICIENT 事件证据不成立/被截断（审计流与租约记录矛盾）',
+      '  ADOPT_EVIDENCE_UNVERIFIABLE 身份无法验证，且策略不允许未验证收养（**默认**）',
+      '  ADOPT_NOT_CLAIMED          任务还没有负责人（直接 claim 即可）',
+      '',
+      '默认策略是严格的：身份无法验证时**拒绝**。只有显式配置 `allowUnverifiedAdoption: true`',
+      '（单机插件）或板服务 `DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT=1` 才放行未验证收养；',
+      '放行后 `lease.adopted` 事件的 payload 里 unverified=true，返回文本也会醒目标注。',
+      '',
+      '链路：单机板直接在本进程判定；远端板把判定交给**板服务**（只有它所在的主机能验 pid），',
+      '所以远端模式下放行策略由板服务配置，不由客户端配置决定。',
+      '',
+      'claim 的现有行为**没有改动**：它仍然是"过期/stale 即可接管"的宽松路径。',
+      '能证明原持有者已死时优先用 adopt（留痕更完整）；adopt 被拒时不要用 claim 绕过同一判断。',
+    ].join('\n'),
+    parameters: {
+      taskId: { type: 'string', required: true, description: '要收养的任务 id' },
+      leaseMs: {
+        type: 'integer',
+        description: '给新持有者的租约时长（毫秒，默认 600000 = 10 分钟）',
+      },
+    },
+    output: textOut,
+  };
+}
+
 export function reportSpec() {
   return {
     name: TOOL_NAMES.report,
@@ -209,6 +269,10 @@ export function dispatchSpec() {
       '     新建出来的会话专属这条任务，不会和别的活抢同一个上下文。',
       '     注意：必须对端开了 allowCreate 才可用（默认关闭）。被拒时会给明确原因，',
       '     **不会**偷偷改投给现成会话。',
+      '     建会话等待与回执窗口是两件事：前者等对端把会话建出来（仍按 ackTimeoutMs，缺省 60s），',
+      '     后者等对面新会话的模型起跑并 ack（实测要 99s）—— 所以 newSession 的回执窗口',
+      '     **强制 ≥180s**（newSessionAckFloorMs，可配置；显式更大的值仍生效）。',
+      '     返回文本会写明实际生效值；若你给的值被下限抬掉，会明确告诉你。',
       '',
       '投递结果**如实返回**：delivered=false 时会给 reason（session-not-live / unreachable /',
       'peer-not-configured 等），不要把它当成派成功。',
@@ -251,7 +315,10 @@ export function dispatchSpec() {
       },
       ackTimeoutMs: {
         type: 'integer',
-        description: '等回执的时限（毫秒，默认 60000）。超时未回执判 ack_timeout；newSession 时也用作建会话的时限',
+        description:
+          '时限（毫秒，默认 60000）。两件事分开：① 建会话等待（仅 newSession）用它，缺省 60000；' +
+          '② 投递成功后的**回执窗口**也用它，但 newSession=true 时窗口强制下限 180000' +
+          '（配置项 newSessionAckFloorMs；显式更大值仍生效）。你给的窗口被下限抬掉时，返回里会写明。',
       },
     },
     output: textOut,
@@ -356,5 +423,6 @@ export function allSpecs() {
     ackSpec(),
     heartbeatSpec(),
     inboxSpec(),
+    adoptSpec(),
   ];
 }

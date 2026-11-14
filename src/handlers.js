@@ -7,6 +7,7 @@
 
 import {
   assertNonEmptyString,
+  DEFAULT_ACK_TIMEOUT_MS,
   describeDelivery,
   formatTaskCard,
   SESSION_CREATE_REJECT_REASONS,
@@ -15,14 +16,53 @@ import {
 } from './domain.js';
 import { collectInbox } from './inbox.js';
 import { instanceIdOf, sessionIdOf } from './session.js';
+import { NEW_SESSION_ACK_FLOOR_MS } from './spec.js';
 
 const DELIVERY_MODES = ['followup', 'steer', 'inject'];
 
 /** 建会话请求的轮询间隔：250ms。够密（60s 窗口内能问 240 次），又不至于把板打满。 */
 const CREATE_POLL_INTERVAL_MS = 250;
 
-/** 默认等待建会话的时限（ackTimeoutMs 没给时）。与 domain 的默认 TTL 保持一致。 */
+/**
+ * 默认等待建会话的时限（ackTimeoutMs 没给时）。与 domain 的默认 TTL 保持一致。
+ *
+ * **注意它和回执窗口的下限不是一回事**：这里等的是"对端把会话建出来"（轮询 3s、60s 够），
+ * 而回执窗口等的是"对面新会话的模型起跑并 ack"（实测 99s）。把两者混成一件是本轮
+ * 明确否掉的方案 —— 所以这个 fallback 保持 60s，不跟 `newSessionAckFloorMs` 走。
+ */
 const CREATE_TIMEOUT_FALLBACK_MS = 60_000;
+
+/** 总管（dispatcher）会话不能执行任务的稳定错误码。 */
+export const DISPATCHER_NOT_EXECUTOR = 'DISPATCHER_NOT_EXECUTOR';
+
+/**
+ * 计算一次派发**实际生效**的 ack 窗口（毫秒）。
+ *
+ * 规则（按 2026-11-14 拍板）：
+ *   - 非 newSession：`ackTimeoutMs ?? 默认 60000`，行为与 0.3.x 完全一致 —— 下限**不**参与。
+ *   - newSession：`max(ackTimeoutMs ?? 默认 60000, newSessionAckFloorMs ?? 180000)`。
+ *     只影响 recordDispatch 的回执窗口；建会话等待仍由 requestRemoteSession 用原值。
+ *
+ * 显式传了非法值（NaN / 负数 / 0）按"没给"处理，避免把 ack_deadline_at 算成 NaN。
+ *
+ * @param {{ackTimeoutMs?: number, newSession?: boolean, floorMs?: number}} [opts]
+ * @returns {number}
+ */
+export function resolveAckWindowMs(opts = {}) {
+  const raw = opts.ackTimeoutMs === undefined || opts.ackTimeoutMs === null
+    ? undefined
+    : Number(opts.ackTimeoutMs);
+  const wanted = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_ACK_TIMEOUT_MS;
+  if (opts.newSession !== true) return wanted;
+  const rawFloor = opts.floorMs === undefined || opts.floorMs === null ? undefined : Number(opts.floorMs);
+  const floor = Number.isFinite(rawFloor) && rawFloor > 0 ? rawFloor : NEW_SESSION_ACK_FLOOR_MS;
+  return Math.max(wanted, floor);
+}
+
+/** 把毫秒渲染成秒（保留一位小数），给返回文本用。 */
+function fmtSeconds(ms) {
+  return `${Math.round((Number(ms) / 1000) * 10) / 10}s`;
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -184,8 +224,104 @@ function fmtEvidenceLines(evidences) {
   });
 }
 
+/** 收养的三类证据：分开显示，**不许合并成一句"通过"**。 */
+function fmtAdoptionEvidence(ev) {
+  const evidence = ev ?? {};
+  const lines = [];
+  const t = evidence.time;
+  if (t !== undefined && t !== null) {
+    const parts = [
+      t.lease_until === null ? 'lease_until=NULL' : `lease_until=${fmtTime(t.lease_until)}`,
+    ];
+    if (t.stale === true) parts.push(`stale=1（标记于 ${t.stale_at === null ? '未知' : fmtTime(t.stale_at)}）`);
+    if (t.expired === true) parts.push('租约已过期');
+    if (typeof t.overrun_ms === 'number') {
+      parts.push(
+        t.overrun_ms >= 0
+          ? `超期 ${t.overrun_ms}ms`
+          : `时间上还有 ${-t.overrun_ms}ms 才到期（本次是 stale 标记放行）`,
+      );
+    }
+    lines.push(`  时间：${parts.join('，')}`);
+  }
+  const id = evidence.identity;
+  if (id !== undefined && id !== null) {
+    lines.push(
+      `  身份：${id.verdict ?? 'unknown'}（${id.reason ?? '-'}）` +
+        `${id.checked_pid === true ? '，已在本机实际探测 pid' : '，未探测 pid'}` +
+        `；持有者 pid=${id.lease_pid ?? 'NULL'} host=${id.lease_host ?? 'NULL'}；判定者 host=${id.judge_host ?? 'NULL'}`,
+    );
+  }
+  const e = evidence.event;
+  if (e !== undefined && e !== null) {
+    lines.push(
+      `  事件：最后一条租约活动 ${e.last_kind ?? '无'} @${e.last_at === null ? '-' : fmtTime(e.last_at)}` +
+        `（seq #${e.last_seq ?? '-'}）；早于 lease_until=${e.last_before_lease_until === true}；` +
+        `期限后续租痕迹 ${e.renewals_after_lease_until ?? 0} 条`,
+    );
+  }
+  return lines;
+}
+
+/** 收养被拒时的回退建议：按稳定码分流，别让调用方把"拒绝"理解成"再试一次"。 */
+function adoptionRejectHint(code) {
+  switch (code) {
+    case 'ADOPT_NOT_STALE':
+      return '租约还在有效期内且没有 stale 标记。等它过期/被扫描标 stale 后再试；持有者自己还活着时应当 heartbeat。';
+    case 'ADOPT_HOLDER_ALIVE':
+      return '同机确认原持有者进程还活着 —— 这不是"死了的租约"。让它自己 heartbeat，或由有权限的人 cancel。';
+    case 'ADOPT_EVIDENCE_INSUFFICIENT':
+      return '审计流与租约记录对不上（或事件扫描被截断）。先 mesh_events 人工核对，不要换个说法重试。';
+    case 'ADOPT_EVIDENCE_UNVERIFIABLE':
+      return (
+        '板服务无法验证原持有者进程是否真的死了（跨机 / 记录缺身份）。这是**能力边界**，不是重试能解决的。' +
+        '确认持有者确实已死后，可显式放行：单机插件配置 allowUnverifiedAdoption: true，' +
+        '或板服务设 DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT=1（放行后审计记 unverified=true）。'
+      );
+    case 'ADOPT_NOT_CLAIMED':
+      return '任务还没有负责人，直接 mesh_task_claim 即可。';
+    default:
+      return '按上面的原因处理；不要用同样的参数重复调用。';
+  }
+}
+
 export function createHandlers(deps) {
   const { getBoard, getInterconnect } = deps;
+
+  /**
+   * 本实例配置的总管会话（可能为空）。
+   * 测试直接构造 handlers 时不传这个依赖 → 空数组，旧的认领行为一字不差。
+   */
+  const dispatcherSessions = () => {
+    if (typeof deps.getDispatcherSessions !== 'function') return [];
+    try {
+      const value = deps.getDispatcherSessions();
+      return Array.isArray(value) ? value : [];
+    } catch {
+      return [];
+    }
+  };
+
+  /**
+   * 总管只分流、不执行：认领入口直接拒，并给出可判定的错误码。
+   * 为什么必须在这里拒，而不是靠提示词约束：模型真的会自己认领，
+   * 于是总管既不该干活又占着租约，派出去的子会话反而认领不到。
+   */
+  const assertNotDispatcher = (actor) => {
+    if (dispatcherSessions().includes(actor)) {
+      throw new TeamError(
+        DISPATCHER_NOT_EXECUTOR,
+        `会话 ${actor} 是总管（dispatcher），只负责分流与代签回执，不执行任务。` +
+          '任务应由总管自动建出的子会话认领；总管要推进任务请用 mesh_dispatch 派出去。',
+      );
+    }
+  };
+
+  /**
+   * 单机板上的「未验证收养」策略。远端板模式下策略由**板服务**决定（只有它所在的主机
+   * 才可能验 pid），客户端这一侧传的值不参与判定 —— spec 里已如实说明这一点。
+   */
+  const allowUnverifiedAdoption = () => deps.allowUnverifiedAdoption === true;
 
   return {
     async mesh_peers(args, exec) {
@@ -286,6 +422,8 @@ export function createHandlers(deps) {
     async mesh_task_claim(args, exec) {
       const taskId = requireTaskId(args);
       const actor = sessionIdOf(exec);
+      // 总管永不执行任务（硬要求）：认领直接拒，错误码固定，别让它变成"租约被占"的模糊失败
+      assertNotDispatcher(actor);
       const { task, deduped } = await getBoard().claimTask(taskId, actor, { leaseMs: args?.leaseMs });
       const lease = task.lease_until === null
         ? ''
@@ -310,6 +448,61 @@ export function createHandlers(deps) {
       ]
         .filter((s) => s.length > 0)
         .join('\n');
+    },
+
+    async mesh_task_adopt(args, exec) {
+      const taskId = requireTaskId(args);
+      const actor = sessionIdOf(exec);
+      // 与 claim 同一条硬规则：总管只分流不执行，不能通过"收养"把活拿到自己名下
+      assertNotDispatcher(actor);
+      let res;
+      try {
+        res = await getBoard().adoptTask(taskId, actor, {
+          leaseMs: args?.leaseMs,
+          allowUnverifiedAdoption: allowUnverifiedAdoption(),
+        });
+      } catch (err) {
+        // 收养被拒是**可预期的正常结果**（不是工具坏了）：把三类证据原样摊开给调用方。
+        // 与 mesh_task_complete 处理门禁拒绝同一套思路：拒绝也要能让人看懂为什么。
+        if (err instanceof TeamError && typeof err.code === 'string' && err.code.startsWith('ADOPT_')) {
+          const detail = err.detail ?? {};
+          const reasons = Array.isArray(detail.reasons)
+            ? detail.reasons
+            : (Array.isArray(err.detail) ? err.detail : [err.message]);
+          return [
+            `收养被拒绝（${err.code}）：${taskId}`,
+            '  原因：',
+            ...reasons.map((r) => `    - ${r}`),
+            '',
+            '当前证据：',
+            ...fmtAdoptionEvidence(detail.evidence),
+            '',
+            `回退：${adoptionRejectHint(err.code)}`,
+          ].join('\n');
+        }
+        throw err;
+      }
+      const leaseText = res.task.lease_until === null
+        ? ''
+        : `\n  租约至：${fmtTime(res.task.lease_until)}（到期前请 mesh_task_heartbeat 续租）`;
+      const lines = [
+        `${res.unverified ? '已收养（⚠ 未验证）' : '已收养（三证据核验通过）'}：${res.task.task_id}`,
+        `  原负责人：${res.from ?? '未知'} → 现在是你（${res.task.owner_session}）`,
+        `  状态：${lifecycleLabel(res.task.lifecycle)}${leaseText}`,
+        '  三证据：',
+        ...fmtAdoptionEvidence(res.evidence),
+        '',
+        '审计里已记 lease.adopted（三类证据 + 结论 + unverified 标记）。',
+      ];
+      if (res.unverified === true) {
+        lines.push(
+          '',
+          '⚠ 这是一次**未验证收养**：板服务无法验证原持有者进程是否真的死了（原因见「身份」一行）。',
+          '  放行仅因为策略显式允许（allowUnverifiedAdoption / DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT）。',
+          '  它不满足"已验证原持有者已死"——出现纠纷时请把这一点当作事实基线。',
+        );
+      }
+      return lines.join('\n');
     },
 
     async mesh_task_ack(args, exec) {
@@ -488,6 +681,17 @@ export function createHandlers(deps) {
         throw new TeamError('INVALID_FIELD', `delivery 必须是 ${DELIVERY_MODES.join(' / ')} 之一`);
       }
 
+      // 回执窗口：只在 newSession 时套下限；普通派发与 0.3.x 一致（默认 60s）。
+      // 建会话等待另算 —— 它仍用 args.ackTimeoutMs 原值（缺省 60s），不跟这个下限走。
+      const requestedAckMs = resolveAckWindowMs({ ackTimeoutMs: args?.ackTimeoutMs, newSession: false });
+      const ackWindowMs = resolveAckWindowMs({
+        ackTimeoutMs: args?.ackTimeoutMs,
+        newSession: wantsNewSession,
+        floorMs: deps.newSessionAckFloorMs,
+      });
+      // 只有在"调用方给了更小的值、被下限顶掉"时才是 true；要显式告诉模型它的值没被采纳
+      const floorApplied = wantsNewSession && ackWindowMs > requestedAckMs;
+
       let sessionId = givenSessionId;
       let createdNote = null;
 
@@ -501,6 +705,7 @@ export function createHandlers(deps) {
           cwd: args?.cwd,
           title: args?.title ?? task.title,
           agentPreset: args?.agentPreset,
+          // 建会话等待保持旧逻辑（不套回执窗口下限）：60s 等"把会话建出来"本来就够
           ackTimeoutMs: args?.ackTimeoutMs,
         });
         if (created.ok !== true) {
@@ -530,7 +735,8 @@ export function createHandlers(deps) {
       // v2：投递成功就开回执窗口，把"送到了没人管"变成可判定的状态
       // v3：新建会话这条事实一并落库，事后能看出"这条派发投的是新建的会话"
       const ackInfo = await board.recordDispatch(taskId, instanceId, sessionId, result, {
-        ackTimeoutMs: args?.ackTimeoutMs,
+        // 实际生效值：newSession 已套过下限（例：给 5000 → 180000）
+        ackTimeoutMs: ackWindowMs,
         createdSession: createdNote !== null,
       });
       const view = describeDelivery(result.delivered === true, ackInfo.ack_state, result.reason);
@@ -541,7 +747,11 @@ export function createHandlers(deps) {
           createdNote === null ? '' : `  ${createdNote}`,
           `  任务：${task.task_id} ${task.title}`,
           result.delivery === undefined ? '' : `  投递方式：${result.delivery}`,
-          `  回执时限：${fmtTime(ackInfo.ack_deadline_at)}（${Math.round((ackInfo.ack_deadline_at - Date.now()) / 1000)}s 内应有 mesh_task_ack）`,
+          // 实际生效值必须写出来：调用方给了 5000 却按 180000 走时，不能让它以为只有 5s
+          `  回执时限：${fmtTime(ackInfo.ack_deadline_at)}（生效窗口 ${ackWindowMs}ms，约 ${fmtSeconds(ackWindowMs)} 内应有 mesh_task_ack）`,
+          floorApplied
+            ? `  ⚠ 你给的 ackTimeoutMs=${requestedAckMs}ms 低于 newSession 下限，已按 ${ackWindowMs}ms 生效（只是抬了回执窗口，没抬建会话等待）`
+            : '',
           '',
           '对方收到任务卡后应当：先 mesh_task_ack（表示收到了），再 mesh_task_claim 认领。',
           '**投递成功 ≠ 对方知道 ≠ 任务完成。** 到时限仍无回执会被判 ack_timeout（"送到了没人管"）。',

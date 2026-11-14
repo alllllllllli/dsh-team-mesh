@@ -28,6 +28,7 @@ import {
   DEFAULT_LEASE_MS,
   DEFAULT_SESSION_REQUEST_TTL_MS,
   defaultIsPidAlive,
+  evaluateAdoption,
   evaluateCompletion,
   leaseHolderIsDead,
   leaseIdentityMatches,
@@ -42,6 +43,16 @@ import { LocalSqliteBackend, defaultBoardPath } from './backend.js';
 import { parseRef } from './refs.js';
 
 export { SCHEMA_VERSION, defaultBoardPath, LocalSqliteBackend } from './backend.js';
+
+/**
+ * 收养判定时，最多回看该任务的多少条最近审计事件。
+ *
+ * 为什么是 2000：一次收养要知道"最后一条租约类事件是哪条"，而租约类事件通常只在
+ * claim / heartbeat 时出现，中间可能夹着大量 evidence.recorded。真实任务的审计条数
+ * 远小于这个量级；超过就把"没找到租约事件"判定为 EVIDENCE_INSUFFICIENT（截断不可当证据），
+ * 而不是悄悄按"没有痕迹"处理。
+ */
+const ADOPT_EVENT_SCAN_LIMIT = 2000;
 
 /**
  * 把一条 evidence_ref 解析成"到底存不存在、哈希是多少"。
@@ -343,6 +354,114 @@ export class Board {
         lease_until: now + leaseMs,
       });
       return { task: this.getTask(taskId), was_stale: wasStale };
+    });
+  }
+
+  /**
+   * 0.4：三证据收养 —— 在写事务内核验 E1 时间 / E2 身份 / E3 事件，全部成立才接管。
+   *
+   * 与 claim 的区别（**claim 的行为一个字都没改**）：
+   *   claim 的判据只有时间：stale 或过期就能抢。它回答不了"原持有者是不是真的死了""这段
+   *   租约在过期后有没有被续过"。收养把这三件事变成必须同时成立的证据，并把身份证据的
+   *   能力边界如实降级 —— 板服务在 A 机，就永远不能替 B 机断言 `pid 1234` 已经不存在。
+   *
+   * 事务边界：读任务 → 读事件 → 判定 → CAS 更新 → 写 `lease.adopted` 审计，全在**同一笔
+   * 写事务**里。这样"证据成立"与"接管落库"之间不存在可乘之机（判完不写、或写完才发现
+   * 证据不成立，都不会发生）。pid 探测是纯读系统调用，放在事务内不会长时间占写锁。
+   *
+   * @param {string} taskId
+   * @param {string} actor 收养者（新负责人）
+   * @param {object} [opts]
+   * @param {number} [opts.leaseMs] 新租约时长，默认 10 分钟
+   * @param {{pid:number,start_sec:number,host:string|null}|null} [opts.identity]
+   *        新持有者身份，三态同 claim：undefined=本进程、null=不知道、对象=调用方上报
+   * @param {{pid:number,start_sec:number,host:string|null}|null} [opts.judgeIdentity]
+   *        **判定者**身份（默认本进程）。HTTP 路径上判定者是板服务自己 —— 决定能不能验 pid
+   * @param {(pid:number)=>boolean} [opts.isPidAlive] 注入的存活探测（测试用）
+   * @param {boolean} [opts.allowUnverifiedAdoption] 跨机/缺身份时是否放行，默认 false
+   * @param {number} [opts.now] 判定时刻（测试用；缺省 Date.now()）
+   * @returns {{task:object, adopted:true, unverified:boolean, verdict:string,
+   *            evidence:object, policy:object}}
+   */
+  adoptTask(taskId, actor, opts = {}) {
+    const leaseMs = Number(opts?.leaseMs ?? DEFAULT_LEASE_MS);
+    const identity = resolveIdentity(opts?.identity);
+    // 判定者是谁：默认本进程。注意 HTTP 路径上这必须是**板服务**自己（不是调用方）——
+    // 只有板服务所在的主机才可能用本地 pid 表验证"同机的持有者死没死"。
+    const judgeIdentity = opts?.judgeIdentity === undefined
+      ? processIdentity()
+      : opts.judgeIdentity;
+    const isPidAlive = typeof opts?.isPidAlive === 'function' ? opts.isPidAlive : defaultIsPidAlive;
+    const allowUnverifiedAdoption = opts?.allowUnverifiedAdoption === true;
+    const nowOpt = Number(opts?.now);
+    return this.tx(() => {
+      const row = this.backend.readTaskRow(taskId);
+      if (row === undefined || row === null) throw new TeamError('TASK_NOT_FOUND', `任务不存在：${taskId}`);
+      const task = this.rowToTask(row);
+      const now = Number.isFinite(nowOpt) ? nowOpt : Date.now();
+      // 事件按 seq 降序（板/后端的查询都是"新的在前"），domain 里只取第一条租约类事件
+      const scanRows = this.backend.queryEvents(ADOPT_EVENT_SCAN_LIMIT, taskId);
+      const events = scanRows.map((r) => ({
+        kind: r.kind,
+        seq: Number(r.seq),
+        created_at: Number(r.created_at),
+      }));
+      const verdict = evaluateAdoption({
+        task,
+        events,
+        identity: judgeIdentity,
+        isPidAlive,
+        now,
+        allowUnverifiedAdoption,
+        eventScanTruncated: scanRows.length >= ADOPT_EVENT_SCAN_LIMIT,
+      });
+      if (verdict.allowed !== true) {
+        // 拒绝也要把三类证据原样带出去：远端 HTTP 会把 detail 透给调用方，
+        // 这样"为什么被拒"不依赖日志就能回答。
+        throw new TeamError(verdict.code, verdict.message, verdict);
+      }
+
+      assertTransition(task.lifecycle, 'working');
+      const leaseUntil = now + leaseMs;
+      const ok = this.backend.updateTaskCas(taskId, task.version, {
+        lifecycle: 'working',
+        owner_session: actor,
+        lease_owner: actor,
+        lease_until: leaseUntil,
+        lease_pid: identity.pid,
+        lease_start_sec: identity.start_sec,
+        lease_host: identity.host,
+        stale: 0,
+        stale_at: null,
+      });
+      if (!ok) throw new TeamError('CONFLICT', `任务 ${taskId} 在你读之后被改过，请重试`);
+      this.appendEvent('lease.adopted', taskId, actor, {
+        from: task.owner_session,
+        from_lifecycle: task.lifecycle,
+        lease_until: leaseUntil,
+        lease_ms: leaseMs,
+        stale: task.stale === 1,
+        // 原租约身份留痕：事后能判断"这次接管是因为进程没了、还是跨机未验证"
+        prev_lease_pid: task.lease_pid,
+        prev_lease_start_sec: task.lease_start_sec,
+        prev_lease_host: task.lease_host,
+        // 三类证据 + 结论，全部进审计（不是只写一句"已收养"）
+        evidence: verdict.evidence,
+        verdict: verdict.verdict,
+        unverified: verdict.unverified === true,
+        policy: verdict.policy,
+        // 新持有者的身份是不是已知（identity=null 时无从得知，与 claim 的 NULL 语义一致）
+        adopter_identity_reported: identity.pid !== null,
+      });
+      return {
+        task: this.getTask(taskId),
+        adopted: true,
+        from: task.owner_session,
+        unverified: verdict.unverified === true,
+        verdict: verdict.verdict,
+        evidence: verdict.evidence,
+        policy: verdict.policy,
+      };
     });
   }
 

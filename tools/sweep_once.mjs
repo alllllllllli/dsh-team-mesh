@@ -4,6 +4,10 @@
  * 不依赖板服务进程里的定时器：自己周期性地 `POST /sweep`，
  * 让「谁负责清扫」从服务进程解耦出去。
  *
+ * 0.4 起 `POST /sweep` 同时做 blob GC（回收无 evidence 引用的过期对象），
+ * 所以这个脚本的输出里也带 gc 计数：`blob_gc_deleted=… kept_referenced=… remaining=…`。
+ * 老服务端没有 gc 段时显示 `blob_gc=unknown`，不把"没实现"说成"删了 0 个"。
+ *
  * 为什么要有这个方案：方案 A（进程内 setInterval）有两个结构性弱点 ——
  *   1. 它和板服务同生共死。板服务挂住（事件循环卡死、库锁死等）时，清扫也一起停，
  *      而且此时正是最需要有人在外面戳它的时候。
@@ -109,8 +113,21 @@ async function main() {
         const ack = r.json.ack?.count ?? 0;
         const lease = r.json.lease?.count ?? 0;
         const sr = r.json.session_request ?? 0;
+        // blob GC 计数（服务端 0.4 起随 sweep 一起跑）。老服务端没有这段 → 显示 unknown，
+        // 不把"服务端没实现"说成"删了 0 个"。
+        const gc = r.json.gc;
+        const gcText = gc === undefined || gc === null
+          ? 'blob_gc=unknown'
+          : gc.enabled === false
+            ? 'blob_gc=disabled'
+            : `blob_gc_deleted=${gc.deleted ?? 0} kept_referenced=${gc.kept_referenced ?? 0} kept_fresh=${gc.kept_fresh ?? 0} remaining=${gc.remaining ?? '?'}`;
         if (!args.quiet) {
-          console.log(`[sweep] ok ${new Date().toISOString()} ${ms}ms ack_timeouts=${ack} lease_stale=${lease} session_request_expired=${sr}`);
+          console.log(`[sweep] ok ${new Date().toISOString()} ${ms}ms ack_timeouts=${ack} lease_stale=${lease} session_request_expired=${sr} ${gcText}`);
+        }
+        // GC 失败不改变退出码：主清扫已经成功，服务是活的；但必须喊出来，否则
+        // "blob 一直没被回收"会以磁盘慢慢涨的形式沉默地发生。
+        if (gc !== undefined && gc !== null && gc.error !== undefined && gc.error !== null) {
+          console.error(`[sweep] WARN blob GC 失败：${gc.error}`);
         }
         return true;
       }

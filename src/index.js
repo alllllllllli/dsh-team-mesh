@@ -17,6 +17,7 @@
 import fs from 'node:fs';
 
 import { serviceSessionRequests } from './createSession.js';
+import { DEFAULT_DISPATCHER_POLL_MS, normalizeDispatcherSessions, startDispatcher } from './dispatcher.js';
 import { createHandlers } from './handlers.js';
 import { installInboxHook } from './inboxHook.js';
 import { RemoteBoard } from './remote.js';
@@ -40,7 +41,7 @@ export const name = 'dsh-team-mesh';
  */
 export const inject = ['tools', 'interconnect'];
 
-export const PLUGIN_VERSION = '0.3.3-prototype';
+export const PLUGIN_VERSION = '0.4.0';
 
 async function loadDefineTool() {
   try {
@@ -157,9 +158,21 @@ async function registerAll(ctx, config, disposers) {
     disposers.push(() => board.close());
   }
 
+  // ── 总管（dispatcher）角色：配置在装配期就规整好 ──
+  // 命中 dispatcherSessions 的会话收到派发时，由插件建一个新子会话去干活，总管自己不动手。
+  // 空数组 = 这个角色不存在，行为与旧版一致。
+  const dispatcherSessions = normalizeDispatcherSessions(config.dispatcherSessions);
+
   const handlers = createHandlers({
     getBoard: () => board,
     getInterconnect: () => interconnectOf(ctx),
+    // 总管角色：命中这些会话的派发由插件自动建子会话分流，且这些会话自己不许认领任务。
+    // 没配就是空数组 —— 旧行为（没有总管概念）一字不差。
+    getDispatcherSessions: () => dispatcherSessions,
+    // newSession 回执窗口下限（默认由 handlers 兜 180s；这里只负责把配置透进去）
+    newSessionAckFloorMs: config.newSessionAckFloorMs,
+    // 0.4：单机板上是否允许"未验证收养"（默认 false = 严格；远端板由板服务自己配置决定）
+    allowUnverifiedAdoption: config.allowUnverifiedAdoption === true,
   });
 
   const defineTool = await loadDefineTool();
@@ -225,6 +238,38 @@ async function registerAll(ctx, config, disposers) {
   disposers.push(() => {
     if (createTimer !== null) clearInterval(createTimer);
   });
+
+  // ── 总管分流：轮询共享板，看到"派给本实例某个总管会话"的派发就建子会话并代签回执 ──
+  // 与建会话服务共用一套"定时器 + 板"的取数方式；失败只记 warn，不拖垮整棵插件树。
+  if (dispatcherSessions.length > 0) {
+    try {
+      const dispatcher = startDispatcher({
+        board,
+        ctx,
+        instanceId: selfInstance,
+        sessions: dispatcherSessions,
+        cwd: config.dispatcherCwd,
+        agentPreset: config.dispatcherAgentPreset,
+        pollMs: Number(config.dispatcherPollMs ?? DEFAULT_DISPATCHER_POLL_MS),
+        logger: ctx?.logger,
+      });
+      disposers.push(() => dispatcher.dispose());
+      try {
+        ctx?.logger?.info?.(
+          `[dsh-team-mesh] 总管分流已启用：${dispatcherSessions.join(', ')}（每 ${dispatcher.pollMs}ms 轮询一次）`,
+        );
+      } catch {
+        /* 日志不可用不影响功能 */
+      }
+    } catch (err) {
+      // 总管功能起不来只影响"自动分流"，共享板与其余工具照常可用
+      try {
+        ctx?.logger?.warn?.(`[dsh-team-mesh] 总管分流未启用：${err?.message ?? err}`);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
 
   // ── 自动收件箱：会话下一轮把新事件摘要注入上下文 ──
   // 这是"发起方知情"的实现。对端做完活不主动发消息，我也能看到 done 事件。

@@ -370,6 +370,35 @@ export class RemoteBoard {
     return { task: r.task, was_stale: r.was_stale === true };
   }
 
+  /**
+   * 0.4：三证据收养。**判定发生在板服务那一侧**（只有板服务所在的主机才可能验 pid），
+   * 所以这里不发送"是否允许未验证"这类策略参数 —— 策略由板服务的配置决定，
+   * 客户端无法自我授权（与"客户端只发意图、不发结论"是同一条安全线）。
+   *
+   * 拒绝时板服务回结构化错误（ADOPT_NOT_STALE / ADOPT_HOLDER_ALIVE / ...），
+   * call() 会把它变成带 code 与 detail 的 TeamError，detail 里就是三类证据原文。
+   */
+  async adoptTask(taskId, actor, opts = {}) {
+    const r = await this.call('POST', '/task/adopt', {
+      body: {
+        taskId,
+        actor,
+        leaseMs: opts?.leaseMs,
+        // 收养后新租约的**持有者**是调用方；身份仍按 v4 的规矩由调用方上报。
+        leaseIdentity: this.leaseIdentity(),
+      },
+    });
+    return {
+      task: r.task,
+      adopted: r.adopted === true,
+      from: r.from ?? null,
+      unverified: r.unverified === true,
+      verdict: r.verdict ?? null,
+      evidence: r.evidence ?? null,
+      policy: r.policy ?? null,
+    };
+  }
+
   async listAcks(taskId) {
     const r = await this.call('GET', '/acks', { query: { taskId } });
     return r.acks;

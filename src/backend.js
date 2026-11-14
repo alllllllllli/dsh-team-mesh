@@ -24,6 +24,17 @@ import { eventPayload } from './domain.js';
 
 export const SCHEMA_VERSION = 4;
 
+/**
+ * blob 默认保留期：7 天。
+ *
+ * 为什么是 7 天而不是"删完即删"：blob 的典型生命周期是**上传 → 几秒后报证据**，
+ * 但这条链路上任何一环都可能断（客户端报证据失败重试、任务被 cancel 后又重开、
+ * 人工补证据）。保留 7 天等于给"上传了但还没被引用"一个远大于实际用时的窗口，
+ * 同时又不至于让孤儿 blob 永久占空间。保留期可配（见 server.js 的
+ * DSH_TEAM_BOARD_BLOB_RETENTION_MS），也可以整体关掉 GC。
+ */
+export const DEFAULT_BLOB_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
 const DDL = `
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -591,6 +602,95 @@ export class LocalSqliteBackend {
   statBlob(sha256) {
     const row = this.db.prepare('SELECT sha256, size FROM blob WHERE sha256 = ?').get(sha256);
     return row === undefined ? null : { sha256: row.sha256, size: Number(row.size) };
+  }
+
+  /**
+   * blob 垃圾回收：删掉「**没有任何 evidence 引用** 且 已过保留期」的 blob。
+   *
+   * 为什么必须按 evidence 引用判定，而不是"看它有没有出现在事件里"：
+   * 事件表是审计流水，会永久保留；用事件当引用源等于永远不回收。
+   * `evidence.ref_sha256` 是门禁实算出来的物证哈希（blob 引用在报证据时
+   * 由 resolveRef 取字节复算后写入），它是**当前仍被验收依据依赖**的唯一事实来源。
+   *
+   * 再保守一层：同时认 `evidence_ref = 'blob://sha256:<hex>'` 这种字符串形式。
+   * 正常路径两列都会写，但库里被人手工改过 / 老版本数据只有一列时，
+   * 单认一列就可能误删一条仍被引用为"待复核物证"的对象 ——
+   * 漏删只是占空间，误删不可恢复，所以两边都扫。
+   *
+   * 幂等：删完再跑一次 deleted 必为 0；被引用的、未到期的永远不删。
+   *
+   * @param {{now?:number, retentionMs?:number}} [opts]
+   * @returns {{enabled:boolean, retention_ms:number, cutoff_at:number, total_before:number,
+   *   candidates:number, deleted:number, freed_bytes:number, kept_referenced:number,
+   *   kept_fresh:number, remaining:number}}
+   */
+  gcBlobs(opts = {}) {
+    const now = Number.isFinite(Number(opts.now)) ? Number(opts.now) : Date.now();
+    const retentionMs = Number.isFinite(Number(opts.retentionMs)) && Number(opts.retentionMs) >= 0
+      ? Math.floor(Number(opts.retentionMs))
+      : DEFAULT_BLOB_RETENTION_MS;
+    const cutoff = now - retentionMs;
+
+    // 一个事务、一条 DELETE：候选与删除之间不会有别的写插进来。
+    // 即便真的并发插进一条新引用，DELETE 自身的 NOT EXISTS 也会当场保住它。
+    return this.tx(() => {
+      const totalBefore = this.countBlobs();
+      const candidates = this.db
+        .prepare(
+          `SELECT sha256, size FROM blob b
+            WHERE b.created_at <= ?
+              AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.ref_sha256 = b.sha256)
+              AND NOT EXISTS (
+                SELECT 1 FROM evidence e2
+                 WHERE e2.evidence_ref = 'blob://sha256:' || b.sha256
+              )`,
+        )
+        .all(cutoff);
+      const del = this.db.prepare(
+        `DELETE FROM blob
+          WHERE sha256 = ?
+            AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.ref_sha256 = ?)
+            AND NOT EXISTS (
+              SELECT 1 FROM evidence e2 WHERE e2.evidence_ref = 'blob://sha256:' || ?
+            )`,
+      );
+      let deleted = 0;
+      let freedBytes = 0;
+      for (const c of candidates) {
+        const info = del.run(c.sha256, c.sha256, c.sha256);
+        if (Number(info.changes) > 0) {
+          deleted += 1;
+          freedBytes += Number(c.size ?? 0);
+        }
+      }
+      const keptReferencedRow = this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM blob b
+            WHERE b.created_at <= ?
+              AND (
+                EXISTS (SELECT 1 FROM evidence e WHERE e.ref_sha256 = b.sha256)
+                OR EXISTS (
+                  SELECT 1 FROM evidence e2 WHERE e2.evidence_ref = 'blob://sha256:' || b.sha256
+                )
+              )`,
+        )
+        .get(cutoff);
+      const keptFreshRow = this.db
+        .prepare('SELECT COUNT(*) AS n FROM blob WHERE created_at > ?')
+        .get(cutoff);
+      return {
+        enabled: true,
+        retention_ms: retentionMs,
+        cutoff_at: cutoff,
+        total_before: totalBefore,
+        candidates: candidates.length,
+        deleted,
+        freed_bytes: freedBytes,
+        kept_referenced: Number(keptReferencedRow.n),
+        kept_fresh: Number(keptFreshRow.n),
+        remaining: totalBefore - deleted,
+      };
+    });
   }
 
   // ───────────────────── v2：投递回执（ack） ─────────────────────

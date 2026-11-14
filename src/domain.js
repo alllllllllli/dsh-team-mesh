@@ -428,6 +428,320 @@ export function leaseHolderIsDead(task, identity, isPidAlive) {
   return { dead: false, reason: 'holder-alive' };
 }
 
+// ─────────────────── 0.4：三证据收养（stale 之后"凭什么接手"） ───────────────────
+
+/**
+ * 「租约类事件」白名单：只有这些事件能证明**持有者自己**续过租 / 还活着。
+ *
+ * 为什么必须白名单而不是"kind 里带 lease 就算"：
+ *   - `lease.stale` 是**扫描者**写的（宣告租约失效），不是持有者活动；把它算进来，
+ *     "过期后没有续租痕迹"这条证据会永远被它自己污染。
+ *   - `lease.adopted` 算活动：收养也刷新 lease_until，需求是"这条租约后来被别人正规接管过"。
+ *   - `task.claimed` / `lease.taken_over` 是认领轨迹；`lease.renewed` 含 heartbeat 与
+ *     claim 去重续租；`lease.revived` 是 stale → live 的复活。
+ * 事件 kind 一旦写进库就是审计事实，这里只做**读侧解释**，不改写历史。
+ */
+export const LEASE_ACTIVITY_EVENT_KINDS = Object.freeze([
+  'task.claimed',
+  'lease.taken_over',
+  'lease.renewed',
+  'lease.revived',
+  'lease.adopted',
+]);
+
+/**
+ * 收养的稳定错误码。用对象而不是散落字面量：拒绝码是**对外契约**（模型和脚本按码分流），
+ * 写错一个字母就等于把"能自愈的拒绝"变成"看不懂的拒绝"。
+ */
+export const ADOPT_CODES = Object.freeze({
+  NOT_STALE: 'ADOPT_NOT_STALE',
+  NOT_CLAIMED: 'ADOPT_NOT_CLAIMED',
+  STATE_INVALID: 'ADOPT_STATE_INVALID',
+  HOLDER_ALIVE: 'ADOPT_HOLDER_ALIVE',
+  EVIDENCE_INSUFFICIENT: 'ADOPT_EVIDENCE_INSUFFICIENT',
+  EVIDENCE_UNVERIFIABLE: 'ADOPT_EVIDENCE_UNVERIFIABLE',
+});
+
+/**
+ * 身份证据"为什么没验成"的人话。这段文案是给模型/人排障用的，必须说清
+ * **是能力边界而不是代码缺陷** —— 否则下次还会有人问"为什么不能跨机验 pid"。
+ */
+function describeUnverifiedIdentity(reason, ev) {
+  switch (reason) {
+    case 'unverified-cross-host':
+      return (
+        `租约持有者在主机 ${ev.lease_host}，判定者（板服务）在 ${ev.judge_host}：` +
+        '跨机器的 pid 属于两套独立编号空间（两边都有 pid 1，纯属巧合），板服务**不能代替远端机器验 pid**，只能标 unverified'
+      );
+    case 'unverified-no-identity':
+      return '租约记录里没有可比的持有者身份（pid 或主机名为 NULL，多为 v3 及以前的老数据），没有东西可验';
+    case 'no-judge-host':
+      return '判定者（板服务/本进程）拿不到自己的主机名（os.hostname() 不可用），无法判断"同机"，也就不能用 pid 下结论';
+    case 'probe-error':
+      return 'pid 存活探测本身失败了（抛错），按"宁可少判、不可误判"处理，不当成已死';
+    default:
+      return `身份证据未验证（${reason ?? 'unknown'}）`;
+  }
+}
+
+function adoptionRejected(code, reasons, evidence) {
+  return {
+    allowed: false,
+    code,
+    message: `${code}：${reasons.join('；')}`,
+    reasons,
+    unverified: false,
+    verdict: 'rejected',
+    evidence: evidence ?? {},
+  };
+}
+
+/**
+ * 三证据收养判定（纯函数，不碰 IO/时钟/进程表 —— pid 探测由调用方注入）。
+ *
+ * 为什么收养比 claim 安全：claim 的判据只有时间（stale / 过期就能抢）。时间只能证明
+ * "它没续租"，不能证明"它真的死了"，更不能证明"这段租约没有被别人续过"。收养要求三类
+ * 证据同时成立，且**身份证据按能力边界如实降级**：
+ *
+ *   E1 时间：lease_until 已过期，或已被扫描标记 stale（记 overrun_ms / stale_at）。
+ *   E2 身份：只有 `lease_host === 判定者主机` 时才有资格验 pid（跨机验 pid 是伪命题）；
+ *            同机 → leaseHolderIsDead（注入 isPidAlive，EPERM 算活着）；
+ *            跨机 / 记录缺身份 / 判定者不知道自己在哪 → **一律 unverified**。
+ *            unverified 不是"等于死了"，默认拒绝；只有显式 allowUnverifiedAdoption=true
+ *            才放行，且 event payload 里 unverified=true 必须如实落地。
+ *   E3 事件：审计流里该任务最后一条租约类事件必须早于 lease_until，且过期后没有任何
+ *            续租痕迹。这一条防的是"库里的 lease_until 与事件流互相矛盾"（例如有人绕过
+ *            正常路径改了时间），仅靠 E1 看 lease_until 是看不出来的。
+ *
+ * 判定顺序与拒绝码：E1 → E2(活着就拒) → E3 → 未验证策略。顺序刻意固定：
+ *   - 持有者明确还活着时，"证据不足/未验证"都是次要信息，先报 ADOPT_HOLDER_ALIVE；
+ *   - 事件证据不自洽（E3 失败）时，无论策略是否允许 unverified 都必须拒 —— 先报充分性问题。
+ *
+ * @param {object} input
+ * @param {object|null} input.task 任务行（rowToTask 之后的形状，含 v4 租约身份字段）
+ * @param {Array<{kind:string,created_at:number,seq?:number}>} [input.events] 该任务事件，**按 seq 降序**
+ * @param {{pid:number|null,start_sec:number|null,host:string|null}|null} [input.identity]
+ *        判定者身份；undefined=本进程（本地板），null=不知道（此时不能验 pid）
+ * @param {(pid:number)=>boolean} [input.isPidAlive] 注入的 pid 存活探测（测试用）
+ * @param {number} [input.now] 判定时刻（显式传入才好测）
+ * @param {boolean} [input.allowUnverifiedAdoption] 跨机/缺身份时是否放行（默认 false = 严格）
+ * @param {boolean} [input.eventScanTruncated] 事件扫描是否被截断（真值时"找不到租约事件"不许当成证据）
+ * @returns {{allowed:boolean, code:string|null, message:string, reasons:string[],
+ *            unverified:boolean, verdict:string, evidence:object, policy?:object}}
+ */
+export function evaluateAdoption(input = {}) {
+  const {
+    task,
+    events = [],
+    identity,
+    isPidAlive,
+    allowUnverifiedAdoption = false,
+    eventScanTruncated = false,
+  } = input;
+  const at = Number.isFinite(Number(input.now)) ? Number(input.now) : Date.now();
+
+  if (task === null || task === undefined) {
+    return adoptionRejected('TASK_NOT_FOUND', ['任务不存在']);
+  }
+  if (TERMINAL.has(task.lifecycle)) {
+    return adoptionRejected('TASK_CLOSED', [`任务已终结（${task.lifecycle}），不能再被收养`]);
+  }
+  if (task.owner_session === null || task.owner_session === undefined) {
+    return adoptionRejected(ADOPT_CODES.NOT_CLAIMED, ['任务还没有负责人，不存在"接管"这回事 —— 直接 claim 即可']);
+  }
+  if (!['claimed', 'working', 'blocked'].includes(task.lifecycle)) {
+    return adoptionRejected(ADOPT_CODES.STATE_INVALID, [
+      `任务状态是 ${task.lifecycle}，只有 claimed / working / blocked 的租约可以被收养`,
+    ]);
+  }
+
+  // ── E1 时间证据 ──
+  const leaseUntil = typeof task.lease_until === 'number' ? task.lease_until : null;
+  const staleFlag = Number(task.stale ?? 0) === 1;
+  const expired = leaseUntil !== null && leaseUntil <= at;
+  const timeEvidence = {
+    lease_until: leaseUntil,
+    expired,
+    stale: staleFlag,
+    stale_at: typeof task.stale_at === 'number' ? task.stale_at : null,
+    // 负数表示"时间上还没到期，是 stale 标记放行的"——如实记录，不为了好看抹成 0
+    overrun_ms: leaseUntil === null ? null : at - leaseUntil,
+  };
+  if (!(staleFlag || expired)) {
+    return adoptionRejected(
+      ADOPT_CODES.NOT_STALE,
+      [
+        `租约还没有过期（lease_until=${leaseUntil === null ? 'NULL' : new Date(leaseUntil).toISOString()}，` +
+          `还有 ${leaseUntil === null ? '未知' : Math.max(0, leaseUntil - at)}ms），也没有 stale 标记：` +
+          '没有时间证据就不能收养。要么等它过期/被扫描标 stale，要么用 heartbeat 证明自己还活着',
+      ],
+      { time: timeEvidence },
+    );
+  }
+
+  // ── E2 身份证据 ──
+  const judge = identity === undefined ? processIdentity() : identity;
+  const leasePid = task.lease_pid === null || task.lease_pid === undefined ? null : Number(task.lease_pid);
+  const leaseHost = task.lease_host === null || task.lease_host === undefined ? null : String(task.lease_host);
+  const judgeHost = judge === null || judge === undefined || judge.host === null || judge.host === undefined
+    ? null
+    : String(judge.host);
+  const identityEvidence = {
+    lease_pid: leasePid,
+    lease_start_sec: task.lease_start_sec === null || task.lease_start_sec === undefined
+      ? null
+      : Number(task.lease_start_sec),
+    lease_host: leaseHost,
+    judge_host: judgeHost,
+    checked_pid: false,
+    verdict: 'unverified',
+    reason: null,
+  };
+  let identityVerified = false;
+  let holderAlive = false;
+
+  const markUnverified = (reason) => {
+    identityEvidence.verdict = 'unverified';
+    identityEvidence.reason = reason;
+  };
+
+  if (judgeHost === null) {
+    markUnverified('no-judge-host');
+  } else if (leaseHost === null) {
+    markUnverified('unverified-no-identity');
+  } else if (leaseHost !== judgeHost) {
+    markUnverified('unverified-cross-host');
+  } else if (leasePid === null) {
+    // 同机但记录里没有 pid：一样没东西可验（不许拿"同机"当已死证据）
+    markUnverified('unverified-no-identity');
+  } else {
+    identityEvidence.checked_pid = true;
+    const dead = leaseHolderIsDead(task, judge, isPidAlive);
+    identityEvidence.reason = dead.reason;
+    if (dead.dead) {
+      identityVerified = true;
+      identityEvidence.verdict = 'verified-dead';
+    } else if (dead.reason === 'probe-error') {
+      markUnverified('probe-error');
+    } else if (dead.reason === 'self' || dead.reason === 'holder-alive') {
+      holderAlive = true;
+      identityEvidence.verdict = 'alive';
+    } else {
+      // 兜底：任何我们无法归类的"没死"都不许升级成 verified
+      markUnverified(dead.reason ?? 'unknown');
+    }
+  }
+  if (holderAlive) {
+    return adoptionRejected(
+      ADOPT_CODES.HOLDER_ALIVE,
+      [
+        `租约持有者（${task.owner_session}）的进程还在同机运行（pid=${leasePid}${identityEvidence.reason === 'self' ? '，就是判定者自己' : ''}）：` +
+          '它不是死了，只是没心跳。请让它自己 heartbeat；抢一条活着的人的租约不是"收养"',
+      ],
+      { time: timeEvidence, identity: identityEvidence },
+    );
+  }
+
+  // ── E3 事件证据 ──
+  const leaseEvents = events.filter((e) => LEASE_ACTIVITY_EVENT_KINDS.includes(String(e.kind)));
+  const sorted = leaseEvents; // 调用方保证按 seq 降序（板服务/Board 的查询都是新的在前）
+  const last = sorted.length > 0 ? sorted[0] : null;
+  const renewalsAfter = leaseUntil === null
+    ? []
+    : leaseEvents.filter((e) => Number(e.created_at) > leaseUntil);
+  const lastBefore = last !== null && leaseUntil !== null && Number(last.created_at) < leaseUntil;
+  const eventEvidence = {
+    scanned: Array.isArray(events) ? events.length : 0,
+    truncated: eventScanTruncated === true,
+    last_kind: last === null ? null : String(last.kind),
+    last_at: last === null ? null : Number(last.created_at),
+    last_seq: last === null || last.seq === undefined ? null : Number(last.seq),
+    lease_until: leaseUntil,
+    last_before_lease_until: lastBefore,
+    renewals_after_lease_until: renewalsAfter.length,
+  };
+  const evidenceSoFar = { time: timeEvidence, identity: identityEvidence, event: eventEvidence };
+  if (eventScanTruncated && leaseEvents.length === 0) {
+    return adoptionRejected(
+      ADOPT_CODES.EVIDENCE_INSUFFICIENT,
+      [
+        `事件扫描被截断（只看最近 ${eventEvidence.scanned} 条）且其中没有任何租约类事件：` +
+          '不能把"没看到"当成"没有"，先人工核对审计流',
+      ],
+      evidenceSoFar,
+    );
+  }
+  if (last === null) {
+    return adoptionRejected(
+      ADOPT_CODES.EVIDENCE_INSUFFICIENT,
+      [
+        '审计流里找不到任何租约类事件（claim / renew / heartbeat / revived）：' +
+          '无法证明"过期后没有续租痕迹"，这条租约的来历不明',
+      ],
+      evidenceSoFar,
+    );
+  }
+  if (leaseUntil === null) {
+    return adoptionRejected(
+      ADOPT_CODES.EVIDENCE_INSUFFICIENT,
+      ['任务有负责人但没有 lease_until：无法把事件时间与租约期限对齐'],
+      evidenceSoFar,
+    );
+  }
+  if (!lastBefore) {
+    return adoptionRejected(
+      ADOPT_CODES.EVIDENCE_INSUFFICIENT,
+      [
+        `最后一条租约类事件是 ${eventEvidence.last_kind} @${new Date(eventEvidence.last_at).toISOString()}，` +
+          `不早于 lease_until（${new Date(leaseUntil).toISOString()}）：租约记录与事件流互相矛盾，不能当"过期后无续租痕迹"`,
+      ],
+      evidenceSoFar,
+    );
+  }
+  if (renewalsAfter.length > 0) {
+    return adoptionRejected(
+      ADOPT_CODES.EVIDENCE_INSUFFICIENT,
+      [
+        `lease_until 之后还有 ${renewalsAfter.length} 条租约类事件：原持有者在"过期"之后仍有续租痕迹，` +
+          '说明它可能还活着，只是租约时间没被续上',
+      ],
+      evidenceSoFar,
+    );
+  }
+
+  // ── 结论：三证据齐了。身份是不是"已验证"决定这是不是一次未验证收养 ──
+  const unverified = identityVerified !== true;
+  const policy = { allow_unverified_adoption: allowUnverifiedAdoption === true };
+  if (unverified && allowUnverifiedAdoption !== true) {
+    return adoptionRejected(
+      ADOPT_CODES.EVIDENCE_UNVERIFIABLE,
+      [
+        `身份证据无法验证：${describeUnverifiedIdentity(identityEvidence.reason, identityEvidence)}`,
+        '默认策略拒绝"未验证收养"（allowUnverifiedAdoption=false）。这不是代码做不到，' +
+          '而是板服务没有资格替远端机器断言进程死亡 —— 把未验证写成已验证比不做判定更危险',
+        '若已通过别的渠道确认持有者真的死了，可在板服务（DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT=1）' +
+          '或单机插件（allowUnverifiedAdoption: true）显式放行，审计里会记 unverified=true',
+      ],
+      evidenceSoFar,
+    );
+  }
+
+  return {
+    allowed: true,
+    code: null,
+    message: unverified
+      ? '已收养（未验证：板服务无法验证原持有者进程是否真的死了）'
+      : '已收养（三证据核验通过）',
+    reasons: unverified
+      ? [`未验证收养：${describeUnverifiedIdentity(identityEvidence.reason, identityEvidence)}`]
+      : [],
+    unverified,
+    verdict: unverified ? 'adopted-unverified' : 'adopted-verified',
+    evidence: evidenceSoFar,
+    policy,
+  };
+}
+
 /**
  * 默认的 pid 存活探测：`process.kill(pid, 0)` 不发信号，只做权限/存在性检查。
  * EPERM 表示进程存在但属于别人 —— **算活着**（这是最容易写错的一处：

@@ -52,6 +52,7 @@
 | `mesh_task_create` | 在共享板上建任务（`requestId` 幂等） |
 | `mesh_task_list` | 列任务（按状态 / 负责人过滤）；显式标出 `STALE` / `ACK_TIMEOUT` |
 | `mesh_task_claim` | 认领 + **拿租约**（默认 10 分钟）；租约内不可被抢，stale 后可接管 |
+| `mesh_task_adopt` | **三证据收养**：租约失效后用时间 + 身份 + 事件三类证据接管（比 claim 更安全，见下文） |
 | `mesh_task_ack` | **收到任务卡后回执**，告诉派发方"有人接了" |
 | `mesh_task_heartbeat` | 续租，表示"我还在干"（建议 ≤5 分钟一次） |
 | `mesh_task_report` | 记录证据：`executed` / `outcome` / `note` / `evidenceRef` |
@@ -60,6 +61,9 @@
 | `mesh_dispatch` | 把自包含任务卡推到对端实例的某个会话，并**开启回执窗口** |
 | `mesh_inbox` | 查看未读动态（按游标增量，不重复刷屏）；正常情况下会自动注入 |
 | `mesh_events` | 看审计事件流 |
+
+共 **13** 个工具，注册名以 `src/spec.js` 的 `TOOL_NAMES` 为准（`toolNames()` 与 `allSpecs()` 逐条对齐，
+契约测试锁住条数）。
 
 > **为什么用 `mesh_` 而不是 `team_`**：DSH 自带的 Agent Teams 已经占了 `team_task_create` /
 > `team_task_list` 这些名字。同名注册会互相遮蔽，所以刻意避让。
@@ -275,7 +279,7 @@ M3/M4 第一次**没被抓到** —— 因为当时的用例只覆盖了"形状�
 没有覆盖"形状非法"和"库里 key 与内容不自洽"。补了两条针对性用例后 6/6。
 这一步是必要的：如果不做变异测试，这两条防御纵深等于没测。
 
-- **契约**：9 个 spec 全部用**宿主真实的 `defineTool`**（从 `app.asar` 解出来的同一版本）编译通过；
+- **契约**：13 个 spec 全部用**宿主真实的 `defineTool`**（从 `app.asar` 解出来的同一版本）编译通过；
   另有一条反向对照，证明"用宿主不认的 schema 关键字会抛错"，以免这条测试变成摆设。
 - **门禁**：`working → done` 缺迁移、抢占、空证据、先过后挂、unknown、审计丢失——每一项都有用例，
   而且对应变异确认会变红。
@@ -430,12 +434,21 @@ dsh plugin --profile <profile> remove dsh-team-mesh
 
 | 项 | 状态 | 原因 |
 | --- | --- | --- |
-| 真实两台物理机（各自独立的 DSH + 真实 SSH 隧道）跨机闭环 | **部分** | 已验证：板服务独立进程 + 两个独立 CLI 进程跨进程闭环、哈希两端一致。真实的跨机器隧道由用户侧安排，未在此环境实测 |
-| 真实两个 DSH 实例之间的 `mesh_dispatch` | **未实测** | 需要第二个实例加载本插件并重启；会打扰用户正在用的实例 |
+| 真实两台物理机（各自独立的 DSH + 真实 SSH 隧道）跨机闭环 | **部分** | 已验证：板服务独立进程 + 两个独立 CLI 进程跨进程闭环、哈希两端一致。真实的跨机器隧道由用户侧安排，未在此环境实测；0.4 的双机交叉验证**进行中**（结论待补） |
+| 真实两个 DSH 实例之间的 `mesh_dispatch` | **进行中（结论待补）** | 0.4 批次已发起双机交叉验证，报告未完成前不当成已验证。历史原因：需要第二个实例加载本插件并重启；会打扰用户正在用的实例 |
+| 真实 DSH 宿主里的总管分流（`sessionController.create()` / `prompt()`） | **未验证** | 签名与字段按 `app.asar` 编译产物核对 + 契约锁测试钉住 AbortSignal；首次 `mode:'queue'` prompt 是否被新会话接受、是否真的起跑并 ack，未在活宿主跑 |
+| 生产板服务换新代码（GC / 落盘审计 / 限流 / `POST /task/adopt`） | **未做** | 需部署 + 重启板服务才生效；本版只改工作副本，没碰生产 13090、没重启任何进程 |
+| 生产库上的真实 blob GC（会删多少 / 下游是否报"对象不存在"） | **未验证** | 只给了只读预检 SQL，没在生产库执行 |
+| 0.4 三块功能的变异测试（mutation） | **未做** | dispatcher / 板硬化 / adopt 只有针对性用例与断言，既有 mutation 脚本未扩展；"这些用例真的会变红"没有变异证明 |
+| 真实双机跨机收养 | **未验证** | 跨机边界用"伪造 `lease_host` 的另一台主机名 + 真实 HTTP"模拟；E2 只比较主机名字符串，这是它能验证的最大范围 |
+| 审计跨天滚动 / 断电丢行 / 高并发限流 | **未验** | 只验了单日文件命名与追加、静态阈值；没有跨天等待、没有压测、没做掉电测试 |
 | 对端会话被唤醒（`resume: true`）的行为 | **未实测** | 会真的花对端的模型额度 |
-| 并发的两个实例同时认领 | **部分** | 用两个 `Board` 指向同一文件 + 两个 CLI 进程验了互斥；没做高并发时序压力测试 |
+| 并发的两个实例同时认领 / 两个总管同时处理同一条派发 | **部分** | 用两个 `Board` 指向同一文件 + 两个 CLI 进程验了互斥；总管竞态靠"cursor 先写"降低风险，没做并发压力测试 |
 | 板服务长期运行的稳定性（内存/连接泄漏） | **未验** | 只做了秒级验证，没有长跑 |
 | Linux/macOS | 未验 | 本次范围只要 Windows |
+
+> 0.4 的双机交叉验证**正在进行中，结论待补**；在报告完成前，本表里与"两机"相关的行一律按未完成处理，
+> 也不在 CHANGELOG 里写结论。
 
 
 ## 我要怎么测
@@ -559,8 +572,141 @@ node tools/client_cli.mjs health  # 板服务运维客户端
   SQLite over SMB 的锁不可靠，WAL 尤其容易损坏。
 - 远端模式**只有一个板服务**（单点）。板服务停了，所有设备的写操作都会失败 —— 但它是
   **明确失败**（`BOARD_UNREACHABLE`），不是静默成功。没有做多副本 / 故障转移。
-- 远端模式**没有租约/超时回收**：一个被认领后死掉的任务会一直挂在 `working`。
-- 没有成员/角色概念：只有会话（session）与任务。原型阶段刻意不引入。
-- `dispatch` 不跟踪回执：任务卡发出去后，对端是否真的动了手，只能看共享板上的证据与事件。
-- blob 目前**只增不删**：没有垃圾回收，长期运行需要手工清理不用的 blob。
-- 板服务没有速率限制 / 审计日志落盘（只在 SQLite 里）。
+- 租约过期只会标 `stale` 并留痕，**没有自动重派**：重新认领（`claim`）或收养（`adopt`）仍要人 / 模型
+  发起，不存在"调度器自动把死掉的任务再派出去"。
+- 没有成员/角色概念：只有会话（session）与任务。原型阶段刻意不引入（总管 dispatcher 是**会话级配置**，
+  不是角色系统）。
+- `mesh_dispatch` 的跟踪止于**回执**（`ack`）：对方接了之后是否真的在干、干到哪一步，只能看共享板上的
+  租约 / 证据 / 事件；派发方不会收到主动推送。
+- 板服务硬化后仍有边界：审计 append **不 fsync**（崩溃/断电可能丢最后几行）；限流是固定窗口
+  （边界允许约 2 倍突发），按 `socket` IP + token 指纹分桶 —— 前面若加了反向代理，所有调用方会共用
+  代理 IP（此时 token 指纹仍能区分密钥）。
+- 总管（dispatcher）在**远端板**模式下只做了代码路径设计（`cursor` 读写都是 `RemoteBoard` 已有方法），
+  没对真实板服务跑过；且远端板禁止客户端写审计，`dispatcher.*` 事件只在本地板可写。
+- 收养（adopt）的"允许未验证"是**策略开关，没有审批流**：谁在什么情况下有权打开
+  `allowUnverifiedAdoption` / `DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT` 属于运维决策；代码只保证
+  "不把未验证写成已验证"。
+
+> 上一版列过的两条限制（`blob` 只增不删、板服务没有速率限制与落盘审计）自 0.4 起不再成立，
+> 见下文「板服务安全与硬化（0.4）」对应小节。
+
+## 板服务安全与硬化（0.4）：监听地址 / blob GC / 落盘审计 / 限流
+
+上面「已知限制」里有两条自本版起不再成立：`blob` 不再是"只增不删"，板服务也补上了速率限制与落盘审计。四项都是**保护**，默认值按「不改变现有行为、不打断正常轮询」来定，且都能用环境变量关掉。
+
+| 能力 | 默认 | 配置 | 要点 |
+| --- | --- | --- | --- |
+| 监听地址 | `127.0.0.1`（**与改造前一致**） | `DSH_TEAM_BOARD_HOST` | `/health` 新增 `listen_host` / `listen_port` / `listen_host_configured` / `listen_exposed` / `listen_hint`，启动日志也打印实际 bind 地址 |
+| blob GC | **启用**，保留 7 天 | `DSH_TEAM_BOARD_BLOB_GC=0` 关；`DSH_TEAM_BOARD_BLOB_RETENTION_MS` 改保留期 | 随 `POST /sweep` 与进程内定时 sweep 一起跑；**只要 blob 还被任意 evidence 的 `ref_sha256` / `blob://sha256:` 引用就永不删除**；幂等；sweep 响应与 `/health.gc` 报计数 |
+| 落盘审计 | **启用**，写板库同目录 `audit/` | `DSH_TEAM_BOARD_AUDIT=0` 关；`DSH_TEAM_BOARD_AUDIT_DIR` 改目录 | 状态变更请求追加 `board-audit-YYYY-MM-DD.jsonl`（按天滚动）；只记路由/状态/耗时/IP/actor/task_id，**不记 token、不记请求体**；写失败只 warn，请求照常成功 |
+| 限流 | **启用**，每调用方 600 次 / 60 秒 | `DSH_TEAM_BOARD_RATE_LIMIT`、`DSH_TEAM_BOARD_RATE_WINDOW_MS`；`=0` 关闭 | 按「客户端 IP + token 指纹」分桶；超限回 `429` + `error.code=RATE_LIMITED` + `retry-after`；`GET /health` 豁免（看门狗不能被自己的探活打死） |
+
+### 租约接管：`claim` 宽松 / `adopt` 三证据（0.4）
+
+`claim` 的判据只有**时间**：`stale` 或租约过期就能接管（行为与改造前完全一致，`lease.taken_over` 留痕）。它回答不了两个问题：**原持有者是不是真的死了**、**这段租约过期后有没有被别人续过**。`mesh_task_adopt` 把这两个问题变成必须同时成立的三类证据：
+
+| 证据 | 判据 | 记进 `lease.adopted` payload |
+| --- | --- | --- |
+| E1 时间 | `lease_until` 已过期，或任务已被扫描标 `stale=1` | `time.lease_until` / `expired` / `stale` / `overrun_ms`（负数表示时间上还没到、是 stale 标记放行的） |
+| E2 身份 | **只有板服务与租约持有者同机时才有资格验 pid**（`os.hostname() == lease_host` 且记录里有 pid）：同机判 pid 是否消失/被复用；跨机、记录缺身份、判定者不知道自己在哪 → 一律 `unverified` | `identity.verdict` / `reason` / `checked_pid` |
+| E3 事件 | 该任务最后一条租约类事件（claim / renew / heartbeat / revived）早于 `lease_until`，且之后没有任何续租痕迹 | `event.last_kind` / `last_at` / `renewals_after_lease_until` |
+
+拒绝码是稳定契约：`ADOPT_NOT_STALE` / `ADOPT_HOLDER_ALIVE` / `ADOPT_EVIDENCE_INSUFFICIENT` / `ADOPT_EVIDENCE_UNVERIFIABLE` / `ADOPT_NOT_CLAIMED` / `ADOPT_STATE_INVALID`（HTTP 层 409）。`claim` 的旧行为未改动 —— 能证明原持有者已死时优先用 `adopt`，被拒时不要用 `claim` 绕过同一个判断。
+
+**诚实边界（这条比功能本身重要）**：板服务在 A 机，就永远不能替 B 机断言"`pid 1234` 已经不存在了"——两台机器各有 pid 1，跨机验 pid 是伪命题。所以 E2 跨机时只能标 `unverified`，**默认策略直接拒绝**（`ADOPT_EVIDENCE_UNVERIFIABLE`）；把未验证写成已验证，比不做判定更危险。确认风险后要放行时：
+
+```yaml
+# 单机板（插件配置）
+- id: dsh-team-mesh
+  config:
+    allowUnverifiedAdoption: true   # 默认 false
+```
+
+```powershell
+# 远端板（板服务进程）：远端模式下的放行策略由板服务决定，客户端无法自我授权
+$env:DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT = "1"
+```
+
+放行后 `lease.adopted` 的 payload 里 `unverified=true`，工具返回文本会醒目标注"未验证收养"，`/health.adoption.allow_unverified` 报当前策略。
+
+### 收窄到 `127.0.0.1` 的利弊
+
+**利**：板服务没有 TLS，只有共享密钥。绑回环时网络上看不到它，跨机由 SSH 隧道负责加密与认证；隧道一断，暴露面自然归零。这是推荐部署方式，也是默认值。
+
+**弊**：别的设备不能直连，每台设备都要各建一条 SSH 隧道/端口转发（`ssh -L 13090:127.0.0.1:13090 ...`），多一层要维护的东西；隧道挂了客户端只会看到 `BOARD_UNREACHABLE`，需要人判断是隧道问题还是板服务问题。
+
+**什么时候才绑 `0.0.0.0`**：只有确认端口落在**受信内网或已有的加密隧道**里、且接受"共享密钥明文过网络"时才这么做。绑了之后 `/health.listen_exposed` 为 `true`，启动日志也会警告——把它接进告警，比事后发现好。
+
+```powershell
+# 推荐：只在本机回环提供服务，跨机走 SSH 隧道
+$env:DSH_TEAM_BOARD_HOST = "127.0.0.1"
+# 仅在受信内网/加密隧道里才这么绑（/health 会标 exposed=true）
+# $env:DSH_TEAM_BOARD_HOST = "0.0.0.0"
+```
+
+## 总管（dispatcher）角色（0.4）：只 ack + spawn，不执行
+
+多台机器一起用时，对端常常**只有一个活会话**，所有任务都堵在它那里：前一个任务没干完，后一个任务卡在
+同一个上下文里排队，表现就是一串 `ack_timeout`。总管角色把"接信"和"干活"拆开：
+
+```yaml
+- id: dsh-team-mesh
+  config:
+    dispatcherSessions: ['<总管会话 id>']   # 命中列表的会话 = 总管，只分流不执行
+    dispatcherCwd: 'C:\work'                # 可选：子会话的工作目录（缺省用宿主默认 cwd）
+    dispatcherAgentPreset: 'default'        # 可选：子会话使用的 agent preset
+    dispatcherPollMs: 3000                  # 可选：轮询共享板的间隔（默认 3000ms，250–60000）
+```
+
+派发给**本实例某个总管会话**（`task.dispatched` 的 `peer_session` 命中、`peer_instance` 是本实例、
+且 `delivered=true`）的任务，插件会：
+
+1. 从共享板读派发事件，**先把去重位点写进 `cursor` 表**（键 `dispatcher@<会话id>`，与真会话的收件箱
+   游标隔离），再去建会话 —— 顺序反了会留下"建完会话但没记上 → 重启再建一个"的双开窗口；
+2. 用 `sessionController.create()` 建**一个**专属子会话，用 `prompt(request, signal)` 投任务书
+   （任务号 + 标题 + brief/验收标准 + claim → 干活 → 心跳 → report → complete 的固定指令）；
+3. 由总管会话身份**代签回执**（`ack.acker` 落的是总管，不是子会话）。子会话任务书里已写明
+   "回执已由总管代签，你不用再调 `mesh_task_ack`"。
+
+**总管永不执行任务**：`mesh_task_claim` / `mesh_task_adopt` 命中总管会话时抛 `DISPATCHER_NOT_EXECUTOR`，
+任务状态与负责人都不变。未配置 `dispatcherSessions` 时，行为与 0.3.x 完全一致（旧调用方不受影响）。
+
+**spawn 失败不许假装受理**：create / prompt 任何一步失败 → **不 ack**、落 `dispatcher.failed`
+（`stage` + `reason`，prompt 失败时带 `child_session`），那条派发保持 pending，最终由板的清扫判成
+`ack_timeout`。这比"已经回执但没人干"诚实得多。
+
+**审计事件**：`dispatcher.spawn_intent` / `dispatcher.spawned` / `dispatcher.failed` /
+`dispatcher.ack_failed` / `dispatcher.skipped`。远端板禁止客户端写审计（`REMOTE_AUDIT_READONLY`），
+所以远端模式下这几类事件降级为本机日志；去重位点仍走 `cursor`（`Board` 与 `RemoteBoard` 都有）。
+
+**哪些派发总管不碰**：派给非总管会话、`peer_instance` 不是本实例、`delivered=false`（没有回执窗口，
+由派发方按"信没送到"收尾）、任务已 `done`/`canceled`（落 `dispatcher.skipped` `task-closed`）、
+任务已有负责人（只代签回执，不建第二个子会话，避免同一任务双开工互相抢租约）、派发窗口已结束
+（`ack_state` 不是 `pending`，已 ack / 已超时）。
+
+**诚实边界**：`sessionController.create()` / `prompt(request, signal)` 的签名与字段是对着装好的
+`app.asar` 编译产物（`@deepseek-ai/dsh-api-session-controller`）逐行核对的，并用契约锁测试钉住
+"prompt 第二个参数必须是 `AbortSignal`"（少传在真机必炸，桩测试不会报）；但**没有在真实 DSH 宿主里
+跑过**。剩下的未验证点：新会话是否接受首次 `mode:'queue'` 的 prompt、是否真的起跑并最终 ack。
+首次真机验证时盯三处：`dispatcher.spawned` 的 `child_session`、子会话是否出现 running/claim、
+该任务最终是否被认领。
+
+## `newSession` 派发的回执窗口下限 180s（0.4）
+
+`mesh_dispatch` 的 `ackTimeoutMs` 同时牵扯两件不同的事，必须分开：
+
+| 等什么 | 用哪个时限 | 行为 |
+| --- | --- | --- |
+| **建会话等待**（仅 `newSession=true`）：等对端把会话建出来 | `ackTimeoutMs`，缺省 60s | **不受下限影响**：轮询周期 3s，60s 本来就够；混成一件事会让旧用例空等 180s |
+| **回执窗口**：投递成功后等对面新会话的模型起跑并 ack | `newSession=true` 时强制 **≥180000ms** | 实测一次要 **99s**，60s 必然误判成 `ack_timeout` |
+
+- 配置项 `newSessionAckFloorMs` 可覆盖 180000；**显式给的更大值仍然生效**（取 `max(你给的, 下限)`）。
+- 返回文本**永远写明实际生效的窗口**；你给的值被下限抬掉时会明确提示（`⚠ …已按 …ms 生效`），
+  不让调用方以为自己的值被采纳了。
+- 非 `newSession` 派发行为不变：仍是 `ackTimeoutMs`，缺省 60s。
+
+## 0.4 双机交叉验证（进行中，结论待补）
+
+两台互相独立的 DSH + 真实隧道 + 同一块板上的交叉验证**仍在进行中**，报告未完成。
+在结论补齐之前，本 README **不声称**双机闭环已验证；相关未验证清单见上文「没验证什么」。
+

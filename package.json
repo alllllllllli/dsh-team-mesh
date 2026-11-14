@@ -1,6 +1,6 @@
 {
   "name": "dsh-team-mesh",
-  "version": "0.3.3-prototype",
+  "version": "0.4.0",
   "description": "Cross-instance and cross-device task mesh for DeepSeek-Harness: shared SQLite board or remote HTTP board service, interconnect dispatch with ack receipts, claim leases with heartbeat, auto-injected inbox cursor with peer-noise filtering, and a completion gate that refuses model self-reports.",
   "keywords": [
     "dsh",
@@ -34,6 +34,7 @@
     "cordis.patch.yml",
     "dsh.plugin.json",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {
