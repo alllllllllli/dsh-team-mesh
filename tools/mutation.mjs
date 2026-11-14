@@ -85,12 +85,31 @@ const MUTANTS = [
 function runTests(files) {
   let raw = '';
   try {
-    raw = execFileSync(process.execPath, ['--test', ...files], { cwd: ROOT, encoding: 'utf8' });
+    // Force the spec reporter: the default reporter differs between Node lines
+    // (22 => TAP '# pass N', 24 => spec 'ℹ pass N'), and a parse that only
+    // knows one of them silently reports pass=-1 and aborts as "baseline not
+    // green" -- a broken mutation gate that looks like a broken baseline.
+    raw = execFileSync(process.execPath, ['--test', '--test-reporter=spec', ...files], {
+      cwd: ROOT,
+      encoding: 'utf8',
+    });
   } catch (err) {
     raw = String(err?.stdout ?? '') || String(err?.message ?? '');
   }
-  const pass = Number(raw.match(/^ℹ pass (\d+)/m)?.[1] ?? -1);
-  const fail = Number(raw.match(/^ℹ fail (\d+)/m)?.[1] ?? -1);
+  // Accept both shapes so an unexpected fallback to TAP still yields numbers
+  // instead of a silent -1.
+  const stat = (name) => {
+    const m =
+      raw.match(new RegExp('^\u2139 ' + name + ' (\\d+)', 'm')) ??
+      raw.match(new RegExp('^# ' + name + ' (\\d+)', 'm'));
+    return m ? Number(m[1]) : -1;
+  };
+  const pass = stat('pass');
+  const fail = stat('fail');
+  if (pass === -1 || fail === -1) {
+    // Never let an unparseable run masquerade as a green or a red baseline.
+    throw new Error('cannot parse test summary from runner output (reporter mismatch?)');
+  }
   return { pass, fail, green: fail === 0 && pass > 0 };
 }
 
