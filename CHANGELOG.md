@@ -89,6 +89,9 @@
   保留在仓库里作为过程材料，对外说明以本文件为准。
 - 0.4.0 已提交进 server 权威仓（commit `80156d8`，23 文件 +6518/−43）；该仓原地全量单测
   239 / 239 通过。
+- **部署状态（2026-11-15）**：生产板服务已重启加载 0.4.0（板服务侧生效）；server 与 mcloud 的 desktop
+  profile 插件文件已升级为 0.4.0，但两边 DSH **未重启**（下次重启才加载）。开关清单与部署事实见
+  `docs/dev/0.4.0-开关清单.md` / `docs/dev/0.4.0-部署记录-20261115.md`。
 
 ### 已验证（本工作副本实跑）
 
@@ -98,6 +101,7 @@
 | `tools/e2e_remote.mjs` | 24 / 24 通过 |
 | `tools/e2e_v2.mjs` | 29 / 29 通过 |
 | **双机独立验证**（真实 mcloud ↔ server 两台机器） | **8 / 8 场景、154 / 154 断言通过，exit 0**（证据 `verify/evidence/run-20261114171435-364d85609d/`；逐条见下文「双机交叉验证」节） |
+| **生产板部署**（server 常驻板服务） | 2026-11-15 已重启加载 0.4.0：`/health` 出现 `listen_*`/`gc`/`audit`/`rate_limit`/`adoption` 段，`schema_version=4`，`adoption.allow_unverified=false`；首轮 sweep 回收 1 个无引用孤儿 blob（约 175 小时龄、7775 B），`kept_referenced=6` / `kept_fresh=8` / `remaining=14` / `failures=0`（详见部署记录） |
 
 说明：本次发布收口**只改版本号与文档**，不改功能代码；上面的单测 / e2e 是收口后重跑的。
 双机验证用的是 server 上的**临时板**（随机端口、临时库、随机 token，`DSH_TEAM_BOARD_SWEEP_MS=0`），
@@ -106,24 +110,28 @@
 
 ### 未验证（诚实边界，别当成已支持）
 
-1. **真实 DSH 宿主里的总管分流没跑过**：`sessionController.create()` / `prompt(request, signal)` 的签名与
+1. **真实 DSH 宿主里的总管分流没跑过（隔离实例验证中）**：0.4.0 在真实 DSH 宿主的**加载 / 工具注册**
+   正由隔离实例验证（结论待补）；`sessionController.create()` / `prompt(request, signal)` 的签名与
    字段是对着装好的 `app.asar`（`@deepseek-ai/dsh-api-session-controller`）编译产物逐行核对的，
    并用契约锁测试钉住"prompt 必须传 AbortSignal"；但新会话是否真的接受 `mode:'queue'` 的首次 prompt、
    是否真的起跑并最终 ack，**未在活宿主实测**。症状会是"建出了子会话但子会话不动"。
 2. **双机验证不是"两个真实 DSH 宿主"**：验证里的客户端是 mcloud 上的独立 Node 进程（`RemoteBoard` /
    裸 HTTP），`mesh_dispatch` 经 interconnect 投递到对端 DSH 会话这一段仍未在双机上覆盖。
-3. **生产板服务未换新代码**：GC / 落盘审计 / 限流 / 监听地址字段 / `POST /task/adopt` 需**部署 + 重启
-   板服务**后才生效；本版没有部署、没有重启生产（13090）。
-4. **生产库上的真实 GC 未执行**：会删多少、删后有无下游引用报"板上没有这个内容寻址对象"，
-   只给了只读预检 SQL（见板服务硬化报告），没在生产库跑。
+3. **插件侧尚未加载 0.4.0**：板服务侧已换新代码并重启（2026-11-15 生效）；server 与 mcloud 的 desktop
+   profile 插件文件已是 0.4.0，但**两边 DSH 未重启**（server 仍是 17:26 那批进程），工具/代码仍是旧版，
+   下次重启才加载。
+4. **生产库真实 GC 只跑过首轮**：2026-11-15 首次 sweep 回收 1 个无引用孤儿 blob（约 175 小时龄、7775 B）；
+   `kept_referenced=6` / `kept_fresh=8` / `remaining=14` / `failures=0`。长期回收节奏、SQLite 文件缩小
+   （不会自动缩）与下游引用都仍需观察；被引用的 blob 一个没删。
 5. **0.4 的三块功能都没有变异测试（mutation）**：dispatcher / 板硬化 / adopt 只有针对性用例与断言，
    "这些用例真的会变红"没有变异证明（既有 mutation 脚本没扩展）。
 6. **真实 OS 级 PID 复用**：双机验证用"同 pid + 不同 start_sec"精确触发了 `PID_REUSED` 判定分支
    （等价输入），但没有制造操作系统把同一 pid 真分配给新进程的巧合（不可控、低概率）；建议以单元测试
    注入覆盖为准。
 7. **板服务在租约存续期间重启**：板进程身份变化对 stale / 先占判定的影响，未在两机场景覆盖。
-8. **进程内定时 sweep 路径**：双机验证用确定性显式 `POST /sweep`（`DSH_TEAM_BOARD_SWEEP_MS=0`）；
-   `>0` 的定时器长驻路径未跑。
+8. **进程内定时 sweep 路径**：双机验证用确定性显式 `POST /sweep`（`DSH_TEAM_BOARD_SWEEP_MS=0`），
+   当时未跑定时器；2026-11-15 生产板重启后由**进程内定时 sweep** 完成首轮回收（部署脚本未外部触发
+   `POST /sweep`），该路径已真实跑过一轮；多轮长驻 / 空转稳定性仍未长跑。
 9. **A1 审计 JSONL 原始文件未进证据**：双机验证的板审计 `.jsonl` 原始文件因远程采集一次超时未进入证据
    目录；审计事实改以 `/events` HTTP 导出为准（覆盖了全部断言）。这是证据链缺口，不是产品缺陷。
 10. **板服务长期运行未验**：没有长跑（内存 / 连接泄漏）、没有审计跨天滚动、没有高并发限流压测；

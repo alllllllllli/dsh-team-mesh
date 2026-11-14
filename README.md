@@ -436,13 +436,13 @@ dsh plugin --profile <profile> remove dsh-team-mesh
 | --- | --- | --- |
 | 真实两台物理机（各自独立的 DSH + 真实 SSH 隧道）跨机闭环 | **已验证（0.4.0 双机验证）** | 真实 mcloud ↔ server 两台机器、临时板 + 真实 HTTP：**8/8 场景、154/154 断言通过、exit 0**；证据 `verify/evidence/run-20261114171435-364d85609d/`。注意：验证客户端是独立 Node 进程，不是真实 DSH 宿主（见下一行） |
 | 真实两个 DSH 实例之间的 `mesh_dispatch` | **未实测** | 双机验证的客户端是独立 Node 进程（`RemoteBoard` / 裸 HTTP），没走 `mesh_dispatch` → interconnect → 对端 DSH 会话；需要两个真实 DSH 宿主加载本插件并重启 |
-| 真实 DSH 宿主里的总管分流（`sessionController.create()` / `prompt()`） | **未验证** | 签名与字段按 `app.asar` 编译产物核对 + 契约锁测试钉住 AbortSignal；首次 `mode:'queue'` prompt 是否被新会话接受、是否真的起跑并 ack，未在活宿主跑 |
-| 生产板服务换新代码（GC / 落盘审计 / 限流 / `POST /task/adopt`） | **未做** | 需部署 + 重启板服务才生效；本版只改工作副本，没碰生产 13090、没重启任何进程 |
-| 生产库上的真实 blob GC（会删多少 / 下游是否报"对象不存在"） | **未验证** | 只给了只读预检 SQL，没在生产库执行 |
+| 真实 DSH 宿主里的总管分流（`sessionController.create()` / `prompt()`） | **未验证（隔离实例验证中）** | 0.4.0 在真实 DSH 宿主的**加载 / 工具注册**正由隔离实例验证（结论待补，另有报告）；`create()` / `prompt()` 签名按 `app.asar` 核对 + 契约锁钉住 AbortSignal，首次 `mode:'queue'` prompt 行为仍未在活宿主跑。在用 DSH（mcloud / server desktop）插件文件已是 0.4.0 但**未重启**，重启后才真正加载（见 `docs/dev/0.4.0-部署记录-20261115.md`） |
+| 生产板服务换新代码（GC / 落盘审计 / 限流 / `POST /task/adopt`） | **已完成（板服务侧）** | 2026-11-15 生产板已重启加载 0.4.0（新 PID/启动时间见部署记录），GC / 落盘审计 / 限流 / adopt 已生效；`schema_version` 仍 4、`adoption.allow_unverified=false`。两处 desktop profile 的 **DSH 尚未重启**，插件侧仍是旧代码 |
+| 生产库上的真实 blob GC（会删多少 / 下游是否报"对象不存在"） | **已完成首轮** | 2026-11-15 首次 sweep 回收 1 个无引用孤儿 blob（约 175 小时龄、7775 B）；`kept_referenced=6` / `kept_fresh=8` / `remaining=14` / `failures=0`。长期回收与磁盘变化仍需观察（被引用的一个没删） |
 | 0.4 三块功能的变异测试（mutation） | **未做** | dispatcher / 板硬化 / adopt 只有针对性用例与断言，既有 mutation 脚本未扩展；"这些用例真的会变红"没有变异证明 |
 | 真实 OS 级 PID 复用 | **未验证** | 双机验证用"同 pid + 不同 start_sec"精确触发 `PID_REUSED` 判定分支（等价输入），没制造 OS 真把同一 pid 分配给新进程的巧合（不可控、低概率）；建议以单测注入覆盖为准 |
 | 板服务在租约存续期间重启 | **未验证** | 板进程身份变化对 stale / 先占判定的影响，未在两机场景覆盖 |
-| 进程内定时 sweep 路径 | **未验证** | 双机验证用确定性显式 `POST /sweep`（`DSH_TEAM_BOARD_SWEEP_MS=0`）；`>0` 的定时器长驻路径未跑 |
+| 进程内定时 sweep 路径 | **部分（生产已跑单轮）** | 双机验证用确定性显式 `POST /sweep`（`DSH_TEAM_BOARD_SWEEP_MS=0`），当时未跑定时器；2026-11-15 生产板重启后由**进程内定时 sweep** 完成首轮回收（部署脚本未外部触发 `POST /sweep`），定时器路径已真实跑过；多轮长驻/空转稳定性仍未单独长跑 |
 | 审计 JSONL 原始文件进证据 | **未验（证据链缺口）** | 双机验证的板审计 `.jsonl` 原始文件因远程采集一次超时未进证据目录；审计事实改以 `/events` HTTP 导出为准（覆盖了全部断言）。非产品缺陷 |
 | 审计跨天滚动 / 断电丢行 / 高并发限流 | **未验** | 只验了单日文件命名与追加、静态阈值；没有跨天等待、没有压测、没做掉电测试 |
 | 对端会话被唤醒（`resume: true`）的行为 | **未实测** | 会真的花对端的模型额度 |
@@ -453,6 +453,8 @@ dsh plugin --profile <profile> remove dsh-team-mesh
 > 0.4.0 的双机交叉验证**已完成**（8/8 场景、154/154 断言，见下文「0.4 双机交叉验证」）。
 > 它覆盖的是"真实两台机器 + 真实 HTTP 板 + 真实子进程 worker"，**不等于**"两个真实 DSH 宿主 + interconnect 派活"，
 > 后者仍在表里标未实测。
+> 2026-11-15 生产板已重启加载 0.4.0（板服务侧生效）；两处 desktop profile 的 DSH 未重启，插件侧待重启生效。
+> 详见 [`docs/dev/0.4.0-部署记录-20261115.md`](docs/dev/0.4.0-部署记录-20261115.md)。
 
 
 ## 我要怎么测
@@ -651,6 +653,45 @@ $env:DSH_TEAM_BOARD_HOST = "127.0.0.1"
 # 仅在受信内网/加密隧道里才这么绑（/health 会标 exposed=true）
 # $env:DSH_TEAM_BOARD_HOST = "0.0.0.0"
 ```
+
+## 开关总表（0.4）
+
+完整清单（名字 / 类型 / 默认值 / 本次生产取值 / 关闭方式 / 风险）见
+[`docs/dev/0.4.0-开关清单.md`](docs/dev/0.4.0-开关清单.md)（逐项对照 `src/` 代码核过）。一页版：
+
+**插件 config（profile 里给插件的配置）**
+
+| 开关 | 默认 | 说明 |
+| --- | --- | --- |
+| `boardEndpoint` | `''`（单机） | 非空 = 连远端板；装配期 `/health` 自检，连不上插件加载失败 |
+| `boardToken` | `''`，回退 `DSH_TEAM_BOARD_TOKEN` | 远端板共享密钥；空则远端写操作 401 |
+| `boardTimeoutMs` | `10000` | 远端 HTTP 超时 |
+| `boardPath` | `$DSH_HOME/team/team.db` | 单机板路径（仅无 `boardEndpoint` 时生效） |
+| `allowCreate` | `false` | 允许对端 `newSession` 在本机建会话（会花本机模型额度） |
+| `createBatchLimit` / `createPollMs` | `5` / `3000` | 建会话请求每轮上限 / 轮询间隔 |
+| `inbox` / `inboxLimit` / `inboxExcludeKinds` | `true` / `20` / `['peer.event']` | 自动收件箱；`excludeKinds: []` = 不过滤 |
+| `dispatcherSessions` | `[]`（**总管默认关**） | 命中会话 id 的派发由插件建子会话 + 代签回执 |
+| `dispatcherCwd` / `dispatcherAgentPreset` | 宿主默认 | 仅总管开启时有效 |
+| `dispatcherPollMs` | `3000`（夹取 250–60000） | 总管轮询间隔 |
+| `newSessionAckFloorMs` | `180000`（180s） | `newSession` 回执窗口下限；只抬回执窗口，不抬建会话等待 |
+| `allowUnverifiedAdoption` | `false`（严格） | **仅单机板**；远端板由板服务策略决定 |
+
+**板服务 env（`node src/server.js` / 计划任务 `dsh-team-board`）**
+
+| 开关 | 代码默认 | 本次生产 | 说明 |
+| --- | --- | --- | --- |
+| `DSH_TEAM_BOARD_HOST` / `_PORT` | `127.0.0.1` / `13090` | **`0.0.0.0`（显式）** / `13090` | 板无 TLS；绑 `0.0.0.0` 必须靠受信内网/防火墙/隧道兜底，`/health.listen_exposed` 可监控 |
+| `DSH_TEAM_BOARD_DB` | `$DSH_HOME/team/team.db` | 默认 | 板库（本版无 schema 变更） |
+| `DSH_TEAM_BOARD_TOKEN` / `_READ_TOKEN` | `''`（写全拒）/ = 写密钥 | 已配置 / 未单独确认 | 值不记录；空 = fail-closed |
+| `DSH_TEAM_BOARD_SWEEP_MS` | `60000` | 默认 | 定时 sweep（主清扫 + blob GC）；`0` 关 |
+| `DSH_TEAM_BOARD_BLOB_GC` / `_BLOB_RETENTION_MS` | 开 / 7 天 | 开 / 7 天 | 只删"无引用且超期"的 blob；被引用的永不删 |
+| `DSH_TEAM_BOARD_AUDIT` / `_AUDIT_DIR` | 开 / `<板库目录>/audit` | 开 / 默认 | 状态变更追加 JSONL；写失败只 warn |
+| `DSH_TEAM_BOARD_RATE_LIMIT` / `_RATE_WINDOW_MS` | `600` / `60000` | 默认 | 每调用方固定窗口；`GET /health` 豁免 |
+| `DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT` | `false`（严格） | `false` | 放行未验证收养；`1/true/yes/on` 才算开 |
+
+> 关值认 `0/false/off/no`，开值认 `1/true/yes/on`（trim + 小写）；数字项非法/空值回落默认。
+> 板服务 env 是**启动期读取**，改完必须重启进程才生效；部署事实与回滚见
+> [`docs/dev/0.4.0-部署记录-20261115.md`](docs/dev/0.4.0-部署记录-20261115.md)。
 
 ## 总管（dispatcher）角色（0.4）：只 ack + spawn，不执行
 
