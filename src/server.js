@@ -135,6 +135,22 @@ function isOffValue(v) {
 }
 
 /**
+ * 配置里常见的"打开"写法：`1 / true / yes / on`（trim + 小写），其余一律 false。
+ *
+ * 为什么要认四种而不是只认 'true'：文档与 CHANGELOG 的示例一直写
+ * `DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT=1`，而 shell / 计划任务里 `=1` 是最常见的写法。
+ * 只认一种的后果不是"少一个语法糖"，而是**按文档配置却不生效** —— 两机验证时 verifier
+ * 实测抓到的就是这个：`=1` 不放行、`=true` 才放行。配置解析必须和文档同一口径。
+ *
+ * 与 isOffValue 对称：认不出的一律 false（缺省关闭，fail-closed），不做"非空即真"的猜测。
+ */
+function isOnValue(v) {
+  if (v === undefined || v === null) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+}
+
+/**
  * 监听地址的安全含义。
  *
  * 板服务**没有 TLS**，只靠共享密钥鉴权。绑定到回环地址时，网络上的攻击面是 0，
@@ -755,6 +771,7 @@ function needsAuth(method, pathname) {
  *     每调用方固定窗口阈值，默认 600 次 / 60000 ms；传 false 或 0 关闭。
  *   - allowUnverifiedAdoption / DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT：是否放行"身份无法验证"的
  *     三证据收养。**默认 false**（跨机/缺身份一律拒绝）；放行后审计事件里 unverified=true。
+ *     环境变量取值接受 `1 / true / yes / on`（trim + 小写），其余一律按关闭处理。
  *
  * @param {{boardPath?:string, host?:string, port?:number, token?:string, board?:Board, logger?:object,
  *   blobGc?:boolean, blobRetentionMs?:number, audit?:boolean, auditDir?:string|null,
@@ -820,8 +837,9 @@ export async function startBoardService(opts = {}) {
   // ── 0.4：未验证收养策略 ──
   // 默认关：跨机/身份缺失时，板服务没有资格断言"远端那个进程死了"，只能如实标 unverified。
   // 把"未验证"当"已验证"是这条链路上最危险的失真，所以放行必须由运维显式打开。
+  // 取值口径见 isOnValue：`1 / true / yes / on` 都算打开（文档示例写的是 =1）。
   const allowUnverifiedAdoption = opts.allowUnverifiedAdoption === true
-    || String(process.env.DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT ?? '').trim().toLowerCase() === 'true';
+    || isOnValue(process.env.DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT);
 
   // 监听信息先占位，listen() 成功后填真值；/health 读的是这个可变对象。
   const listenState = { host: null, port: null, configured_host: host, exposed: null, hint: null };

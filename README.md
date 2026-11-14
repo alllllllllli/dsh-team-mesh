@@ -434,21 +434,25 @@ dsh plugin --profile <profile> remove dsh-team-mesh
 
 | 项 | 状态 | 原因 |
 | --- | --- | --- |
-| 真实两台物理机（各自独立的 DSH + 真实 SSH 隧道）跨机闭环 | **部分** | 已验证：板服务独立进程 + 两个独立 CLI 进程跨进程闭环、哈希两端一致。真实的跨机器隧道由用户侧安排，未在此环境实测；0.4 的双机交叉验证**进行中**（结论待补） |
-| 真实两个 DSH 实例之间的 `mesh_dispatch` | **进行中（结论待补）** | 0.4 批次已发起双机交叉验证，报告未完成前不当成已验证。历史原因：需要第二个实例加载本插件并重启；会打扰用户正在用的实例 |
+| 真实两台物理机（各自独立的 DSH + 真实 SSH 隧道）跨机闭环 | **已验证（0.4.0 双机验证）** | 真实 mcloud ↔ server 两台机器、临时板 + 真实 HTTP：**8/8 场景、154/154 断言通过、exit 0**；证据 `verify/evidence/run-20261114171435-364d85609d/`。注意：验证客户端是独立 Node 进程，不是真实 DSH 宿主（见下一行） |
+| 真实两个 DSH 实例之间的 `mesh_dispatch` | **未实测** | 双机验证的客户端是独立 Node 进程（`RemoteBoard` / 裸 HTTP），没走 `mesh_dispatch` → interconnect → 对端 DSH 会话；需要两个真实 DSH 宿主加载本插件并重启 |
 | 真实 DSH 宿主里的总管分流（`sessionController.create()` / `prompt()`） | **未验证** | 签名与字段按 `app.asar` 编译产物核对 + 契约锁测试钉住 AbortSignal；首次 `mode:'queue'` prompt 是否被新会话接受、是否真的起跑并 ack，未在活宿主跑 |
 | 生产板服务换新代码（GC / 落盘审计 / 限流 / `POST /task/adopt`） | **未做** | 需部署 + 重启板服务才生效；本版只改工作副本，没碰生产 13090、没重启任何进程 |
 | 生产库上的真实 blob GC（会删多少 / 下游是否报"对象不存在"） | **未验证** | 只给了只读预检 SQL，没在生产库执行 |
 | 0.4 三块功能的变异测试（mutation） | **未做** | dispatcher / 板硬化 / adopt 只有针对性用例与断言，既有 mutation 脚本未扩展；"这些用例真的会变红"没有变异证明 |
-| 真实双机跨机收养 | **未验证** | 跨机边界用"伪造 `lease_host` 的另一台主机名 + 真实 HTTP"模拟；E2 只比较主机名字符串，这是它能验证的最大范围 |
+| 真实 OS 级 PID 复用 | **未验证** | 双机验证用"同 pid + 不同 start_sec"精确触发 `PID_REUSED` 判定分支（等价输入），没制造 OS 真把同一 pid 分配给新进程的巧合（不可控、低概率）；建议以单测注入覆盖为准 |
+| 板服务在租约存续期间重启 | **未验证** | 板进程身份变化对 stale / 先占判定的影响，未在两机场景覆盖 |
+| 进程内定时 sweep 路径 | **未验证** | 双机验证用确定性显式 `POST /sweep`（`DSH_TEAM_BOARD_SWEEP_MS=0`）；`>0` 的定时器长驻路径未跑 |
+| 审计 JSONL 原始文件进证据 | **未验（证据链缺口）** | 双机验证的板审计 `.jsonl` 原始文件因远程采集一次超时未进证据目录；审计事实改以 `/events` HTTP 导出为准（覆盖了全部断言）。非产品缺陷 |
 | 审计跨天滚动 / 断电丢行 / 高并发限流 | **未验** | 只验了单日文件命名与追加、静态阈值；没有跨天等待、没有压测、没做掉电测试 |
 | 对端会话被唤醒（`resume: true`）的行为 | **未实测** | 会真的花对端的模型额度 |
 | 并发的两个实例同时认领 / 两个总管同时处理同一条派发 | **部分** | 用两个 `Board` 指向同一文件 + 两个 CLI 进程验了互斥；总管竞态靠"cursor 先写"降低风险，没做并发压力测试 |
 | 板服务长期运行的稳定性（内存/连接泄漏） | **未验** | 只做了秒级验证，没有长跑 |
 | Linux/macOS | 未验 | 本次范围只要 Windows |
 
-> 0.4 的双机交叉验证**正在进行中，结论待补**；在报告完成前，本表里与"两机"相关的行一律按未完成处理，
-> 也不在 CHANGELOG 里写结论。
+> 0.4.0 的双机交叉验证**已完成**（8/8 场景、154/154 断言，见下文「0.4 双机交叉验证」）。
+> 它覆盖的是"真实两台机器 + 真实 HTTP 板 + 真实子进程 worker"，**不等于**"两个真实 DSH 宿主 + interconnect 派活"，
+> 后者仍在表里标未实测。
 
 
 ## 我要怎么测
@@ -624,10 +628,14 @@ node tools/client_cli.mjs health  # 板服务运维客户端
 
 ```powershell
 # 远端板（板服务进程）：远端模式下的放行策略由板服务决定，客户端无法自我授权
+# 取值 1 / true / yes / on 均可（解析口径已在本次发布前修正，见下方 P1）
 $env:DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT = "1"
 ```
 
 放行后 `lease.adopted` 的 payload 里 `unverified=true`，工具返回文本会醒目标注"未验证收养"，`/health.adoption.allow_unverified` 报当前策略。
+
+> **P1（本次发布前已修正，同一 0.4.0）**：早期解析只认 `true`（`=1` 会被忽略 —— 安全方向仍是默认拒绝，但会让人误以为已放行）；现在接受 `1/true/yes/on`。
+> **P2（本次发布前已修正，同一 0.4.0）**：`ADOPT_EVIDENCE_UNVERIFIABLE` 的拒绝响应 detail 现在也带 `policy` 字段（与成功响应同口径），可从拒绝响应直接判断当前策略。
 
 ### 收窄到 `127.0.0.1` 的利弊
 
@@ -705,8 +713,30 @@ $env:DSH_TEAM_BOARD_HOST = "127.0.0.1"
   不让调用方以为自己的值被采纳了。
 - 非 `newSession` 派发行为不变：仍是 `ackTimeoutMs`，缺省 60s。
 
-## 0.4 双机交叉验证（进行中，结论待补）
+## 0.4 双机交叉验证（已完成：8/8 场景、154/154 断言）
 
-两台互相独立的 DSH + 真实隧道 + 同一块板上的交叉验证**仍在进行中**，报告未完成。
-在结论补齐之前，本 README **不声称**双机闭环已验证；相关未验证清单见上文「没验证什么」。
+真实双机：客户端 mcloud ↔ 板服务 server（LAN 直连；server 上起临时板，随机端口 / 临时库 / 随机 token，
+审计落盘开启，`DSH_TEAM_BOARD_SWEEP_MS=0` 由测试显式 `POST /sweep` 驱动）。
+**阶段一 4/4 + 阶段二 4/4、154/154 断言通过、exit 0**；证据 `verify/evidence/run-20261114171435-364d85609d/`
+（`summary.json` overall=PASS、`exit-code.txt`=0）。八个场景：
+
+1. **跨机闭环**：`lease_host` = 客户端主机 ≠ 板服务主机；服务端实算 sha256 与客户端一致；本机绝对路径跨机
+   不可采信（必须走内容寻址）；门禁放行、任务 `done`。
+2. **真进程崩溃 → stale → 接管**：`taskkill /F` 真杀 worker；租约未到期 claim → 409 `ALREADY_CLAIMED`
+   （不提前抢活）；到期 sweep 标 stale（跨机只认时间，`overrun_ms` 248ms）；接管留 `lease.taken_over`
+   （`prev_lease_pid/start_sec` 完整）。
+3. **PID 复用**：冒用旧 owner 身份 / 同 pid 不同 start_sec 两种形态均 400 `PID_REUSED`，拒绝无副作用。
+4. **门禁不放松**：无证据 → 409 `NO_EVIDENCE`；最后一条可采信为 `fail` → 409 `LATEST_FAIL`；补 `pass` 后可完成。
+5. **同机收养 verified**：持有者在板服务同机，硬杀后 sweep 走 dead-holder 分支（`reason=holder-pid-gone`，
+   `overrun_ms` 为负）；adopt → 200：`unverified=false`、`checked_pid=true`、`verdict=adopted-verified`。
+6. **跨机收养默认拒绝**：adopt → 409 `ADOPT_EVIDENCE_UNVERIFIABLE`（`unverified-cross-host`）；owner/stale 不变、
+   无 `lease.adopted` 事件。
+7. **显式放行（未验证收养）**：另起一块设放行策略的板 → adopt 200，但返回与审计都标 `unverified=true`、
+   `verdict=adopted-unverified`、`checked_pid=false`；不存在"看起来已验证"的字段。
+8. **拒绝路径非永久**：`ADOPT_NOT_STALE` / `ADOPT_NOT_CLAIMED` / `ADOPT_HOLDER_ALIVE` 均 409；随后真杀持有者
+   再 adopt → 200 `adopted-verified`（判定随事实变化）。
+
+**诚实边界**：验证客户端是独立 Node 进程而非真实 DSH 宿主，`mesh_dispatch`/interconnect 链路未覆盖；
+临时板不是生产 13090，生产部署/重启与生产库 GC 仍未做（见上文「没验证什么」）。
+P1/P2 两个实现缺口已在本次 0.4.0 发布前修正（同一版本，见上文「租约接管」小节）。
 

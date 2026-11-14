@@ -786,6 +786,8 @@ test('H3 真 HTTP 拒绝：持有者进程还活着 → 409 + ADOPT_HOLDER_ALIVE
       assert.ok(err instanceof TeamError);
       assert.equal(err.code, ADOPT_CODES.HOLDER_ALIVE);
       assert.equal(err.detail?.evidence?.identity?.verdict, 'alive');
+      // P2：拒绝 detail 必须带策略快照，排查时才知道"是没配放行还是被别的证据挡住"
+      assert.deepEqual(err.detail?.policy, { allow_unverified_adoption: false });
       return true;
     },
   );
@@ -815,6 +817,8 @@ test('H4 真 HTTP 跨机租约：默认 409 ADOPT_EVIDENCE_UNVERIFIABLE；板服
       assert.equal(err.code, ADOPT_CODES.EVIDENCE_UNVERIFIABLE);
       assert.equal(err.detail?.evidence?.identity?.reason, 'unverified-cross-host');
       assert.equal(err.detail?.evidence?.identity?.checked_pid, false);
+      // P2：默认严格策略下，拒绝 detail 里要能直接看到 policy=false
+      assert.deepEqual(err.detail?.policy, { allow_unverified_adoption: false });
       return true;
     },
   );
@@ -837,6 +841,7 @@ test('H4 真 HTTP 跨机租约：默认 409 ADOPT_EVIDENCE_UNVERIFIABLE；板服
   assert.equal(res.adopted, true);
   assert.equal(res.unverified, true);
   assert.equal(res.verdict, 'adopted-unverified');
+  assert.deepEqual(res.policy, { allow_unverified_adoption: true });
   assert.equal(res.evidence.identity.reason, 'unverified-cross-host');
   assert.equal((await looseClient.health()).adoption.allow_unverified, true);
 
@@ -928,4 +933,182 @@ test('S2 handlers 与 spec 名字对齐：createHandlers 里存在 mesh_task_ado
   const b = newBoard();
   const h = createHandlers({ getBoard: () => b, getInterconnect: () => null });
   assert.equal(typeof h[TOOL_NAMES.adopt], 'function');
+});
+
+// ═════════════════ 回归修复：P2 拒绝 detail 带 policy / P1 env 取值口径 ═════════════════
+// 这两条来自两机验证（verifier）抓到的真实缺陷，不是补功能：
+//   P1 文档写 `DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT=1`，旧代码只认 `true` → 按文档配置不生效；
+//   P2 拒绝时 detail 没带 policy → 排查时分不清"没配放行"与"被别的证据挡住"。
+// 测试方式刻意选"真起临时板服务、真读 env、HTTP 层断言"，因为要防的正是
+// "常量写对了但启动路径没读到"这类只在真实装配里才会暴露的问题。
+
+test('P16 纯函数：每个拒绝码的 detail 都带 policy 快照（与成功响应同一口径）', () => {
+  const base = {
+    task: fakeTask(),
+    events: [claimEvent()],
+    identity: { pid: 100, start_sec: 5000, host: 'HOST-A' },
+    isPidAlive: () => false,
+    now: NOW_AFTER,
+  };
+  const cases = [
+    ['时间证据不成立', { now: LEASE_UNTIL - 1 }, ADOPT_CODES.NOT_STALE],
+    ['持有者还活着', { isPidAlive: () => true }, ADOPT_CODES.HOLDER_ALIVE],
+    ['事件证据不足', { events: [] }, ADOPT_CODES.EVIDENCE_INSUFFICIENT],
+    ['跨机未验证', { task: fakeTask({ lease_host: 'HOST-B' }) }, ADOPT_CODES.EVIDENCE_UNVERIFIABLE],
+    ['无负责人', { task: fakeTask({ owner_session: null, lifecycle: 'open' }) }, ADOPT_CODES.NOT_CLAIMED],
+    ['已终结', { task: fakeTask({ lifecycle: 'done' }) }, 'TASK_CLOSED'],
+  ];
+  for (const [label, over, code] of cases) {
+    const v = evaluateAdoption({ ...base, ...over });
+    assert.equal(v.allowed, false, label);
+    assert.equal(v.code, code, label);
+    assert.deepEqual(v.policy, { allow_unverified_adoption: false }, `${label}：拒绝也必须带 policy`);
+  }
+  // 策略为 true 时，其它原因导致的拒绝也要如实写 true —— 否则会误读成"没配放行"
+  const alive = evaluateAdoption({ ...base, isPidAlive: () => true, allowUnverifiedAdoption: true });
+  assert.equal(alive.code, ADOPT_CODES.HOLDER_ALIVE);
+  assert.deepEqual(alive.policy, { allow_unverified_adoption: true });
+});
+
+test('B11 Board 抛出的拒绝 detail 带 policy（未验证默认 false / 放行策略下其它拒绝 true）', () => {
+  const b = newBoard();
+  const t = makeTask(b);
+  b.claimTask(t.task_id, 's-old', {
+    identity: { pid: 999_999, start_sec: 1, host: 'SOME-OTHER-HOST' },
+    leaseMs: 600_000,
+  });
+  const claimed = b.getTask(t.task_id);
+  assert.throws(
+    () => b.adoptTask(t.task_id, 's-new', { now: claimed.lease_until + 1000 }),
+    (err) => {
+      assert.equal(err.code, ADOPT_CODES.EVIDENCE_UNVERIFIABLE);
+      assert.deepEqual(err.detail.policy, { allow_unverified_adoption: false });
+      return true;
+    },
+  );
+
+  // 策略已开，但这条被"持有者活着"挡住：policy 应如实是 true
+  const t2 = makeTask(b);
+  b.claimTask(t2.task_id, 's-old', { leaseMs: 600_000 }); // 本进程身份 → self/alive
+  const claimed2 = b.getTask(t2.task_id);
+  assert.throws(
+    () => b.adoptTask(t2.task_id, 's-new', {
+      now: claimed2.lease_until + 1000,
+      allowUnverifiedAdoption: true,
+    }),
+    (err) => {
+      assert.equal(err.code, ADOPT_CODES.HOLDER_ALIVE);
+      assert.deepEqual(err.detail.policy, { allow_unverified_adoption: true });
+      return true;
+    },
+  );
+});
+
+/**
+ * 起一个临时板服务，**专门**验证启动时对 env 的读取；用完立刻关闭。
+ * 不能复用共享的 startService：这里每条用例代表一次"冷启动只读一次 env"，
+ * 复用服务等于把"启动时读配置"这件事测成"读了一次以后一直用旧值"。
+ */
+async function startEnvService(overrides = {}) {
+  const dir = mkTmp('mesh-adopt-env-');
+  return startBoardService({
+    boardPath: path.join(dir, 'board.db'),
+    host: '127.0.0.1',
+    port: 0,
+    token: TOKEN,
+    readToken: READ_TOKEN,
+    sweep: false,
+    logger: { warn: () => {}, info: () => {} },
+    ...overrides,
+  });
+}
+
+test('H8 DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT：六种取值真读 env，HTTP /health 如实报', async () => {
+  const cases = [
+    ['1', true],
+    ['true', true],
+    ['yes', true],
+    ['0', false],
+    ['false', false],
+    ['', false],
+    // 额外一条：大小写 + 首尾空白也要归一（文档口径之外的健壮性，不改变六种主取值语义）
+    [' ON ', true],
+  ];
+  const table = [];
+  try {
+    for (const [value, expected] of cases) {
+      process.env.DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT = value;
+      const svc = await startEnvService();
+      try {
+        assert.ok(svc.port > 0);
+        const health = await rawRequest(`http://127.0.0.1:${svc.port}`, '/health', { token: TOKEN });
+        assert.equal(health.status, 200);
+        assert.equal(
+          health.body.adoption.allow_unverified,
+          expected,
+          `env=${JSON.stringify(value)} 时 /health.adoption.allow_unverified 应为 ${expected}`,
+        );
+        table.push(`${value === '' ? '(空)' : value} => ${health.body.adoption.allow_unverified}`);
+      } finally {
+        await svc.close();
+      }
+    }
+  } finally {
+    delete process.env.DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT;
+  }
+  assert.equal(table.length, cases.length, `每种取值都应真起过一次服务：${table.join(' | ')}`);
+});
+
+test('H9 opts.allowUnverifiedAdoption === true 语义不动：env=0 也放行；都不给时默认关闭', async () => {
+  process.env.DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT = '0';
+  let svc = await startEnvService({ allowUnverifiedAdoption: true });
+  try {
+    const health = await rawRequest(`http://127.0.0.1:${svc.port}`, '/health', { token: TOKEN });
+    assert.equal(health.body.adoption.allow_unverified, true, '显式 opts=true 不应被 env=0 覆盖');
+  } finally {
+    await svc.close();
+  }
+
+  delete process.env.DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT;
+  svc = await startEnvService();
+  try {
+    const health = await rawRequest(`http://127.0.0.1:${svc.port}`, '/health', { token: TOKEN });
+    assert.equal(health.body.adoption.allow_unverified, false, '什么都不给必须默认严格');
+  } finally {
+    await svc.close();
+  }
+});
+
+test('H10 env=1 端到端：跨机未验证收养真的被放行（verifier 发现的那条路径）', async () => {
+  process.env.DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT = '1';
+  let svc;
+  try {
+    svc = await startEnvService();
+    const endpoint = `http://127.0.0.1:${svc.port}`;
+    const client = new RemoteBoard({ endpoint, token: TOKEN });
+    const { task } = await newTaskRemote(client, 's-owner', 'env=1 端到端');
+    // 伪造"来自另一台机器"的认领：真实部署里就是远端设备连这块板
+    const claimed = await rawRequest(endpoint, '/task/claim', {
+      method: 'POST',
+      body: {
+        taskId: task.task_id,
+        actor: 's-remote',
+        leaseMs: 400,
+        leaseIdentity: { pid: 424242, start_sec: 99, host: 'REMOTE-HOST-X' },
+      },
+    });
+    assert.equal(claimed.status, 200);
+    await waitLeaseExpired(client, task.task_id);
+
+    const res = await client.adoptTask(task.task_id, 's-new');
+    assert.equal(res.adopted, true, `env=1 时跨机收养应放行，实际 ${JSON.stringify(res)}`);
+    assert.equal(res.unverified, true);
+    assert.deepEqual(res.policy, { allow_unverified_adoption: true });
+    const adopted = (await client.recentEvents(50, task.task_id)).find((e) => e.kind === 'lease.adopted');
+    assert.ok(adopted !== undefined);
+    assert.equal(adopted.payload.unverified, true);
+  } finally {
+    delete process.env.DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT;
+    if (svc !== undefined) await svc.close();
+  }
 });

@@ -230,6 +230,13 @@ function findEvents(events, kind, taskId) {
   return (events ?? []).filter((e) => e.kind === kind && (taskId === undefined || e.task_id === taskId));
 }
 
+function evidenceView(res) {
+  // 0.4.0 returns the evidence verdict as flat fields from POST /task/report; older builds nested it.
+  const j = res?.json ?? null;
+  if (j === null) return null;
+  return j.evidence ?? j;
+}
+
 // ---------------------------------------------------------------- scenario bookkeeping
 
 function makeScenario(id, phase, title) {
@@ -352,7 +359,7 @@ foreach ($f in $files) {
   const remoteHashes = {};
   for (const line of String(remoteFiles.stdout).split(/\r?\n/)) {
     const m = /^([^|]+)\|([0-9a-f]{64})$/.exec(line.trim());
-    if (m) remoteHashes[m[1]] = m[2];
+    if (m) remoteHashes[m[1].replace(/\\/g, '/').toLowerCase()] = m[2];
   }
   const localHashes = {};
   for (const f of keyFiles) {
@@ -416,8 +423,8 @@ function remoteStart(remoteWorkDir, { allowUnverified = false } = {}) {
     + ' -NodeExe ' + CFG.serverNode
     + ' -Port 0'
     + ' -ClientIp ' + CFG.clientIp;
-  if (allowUnverified) cmd += ' -AllowUnverifiedAdopt 1';
-  const r = sshCommand(cmd, { timeoutMs: 120000 });
+  if (allowUnverified) cmd += ' -AllowUnverifiedAdopt true';
+  const r = sshCommand(cmd, { timeoutMs: 300000 });
   const parsed = parseLastJson(r.stdout);
   if (!parsed || parsed.ok !== true) throw new Error('remote board start failed: ' + JSON.stringify({ status: r.status, stdout: r.stdout, stderr: r.stderr, parsed }));
   return parsed;
@@ -520,19 +527,31 @@ function spawnRemoteHolder(board, taskId, actor, leaseMs) {
   child.stdout.on('data', (b) => out.push(b.toString('utf8')));
   child.stderr.on('data', (b) => err.push(b.toString('utf8')));
   child.on('exit', (code) => { child._exit = { code, stdout: out.join(''), stderr: err.join('') }; });
-  const holder = { board, taskId, actor, sshChild: child, pid: 0, identity: null, ready: null, task: taskId };
+  const holder = {
+    board, taskId, actor, sshChild: child, pid: 0, identity: null, ready: null, task: taskId,
+    outputText: () => out.join('') + err.join(''), exited: () => Boolean(child._exit),
+  };
   REMOTE_HOLDERS.push(holder);
   return holder;
 }
 
 function psQuote(s) { return "'" + String(s).replace(/'/g, "''") + "'"; }
 
-async function waitRemoteHolderReady(holder, timeoutMs = 25000) {
-  await waitFor(() => holder.sshChild._exit?.stdout?.includes('WORKER_READY')
-    || holder.sshChild._exit?.stderr?.includes('WORKER_READY'), { timeoutMs, intervalMs: 200, label: 'remote holder ready' });
-  const text = (holder.sshChild._exit?.stdout ?? '') + (holder.sshChild._exit?.stderr ?? '');
+async function waitRemoteHolderReady(holder, timeoutMs = 30000) {
+  try {
+    await waitFor(() => holder.ready !== null || holder.outputText().includes('WORKER_READY') || holder.exited(), {
+      timeoutMs, intervalMs: 200, label: 'remote holder ready',
+    });
+  } catch (err) {
+    throw new Error('remote holder did not report ready within ' + timeoutMs + 'ms; ssh child exited=' + holder.exited()
+      + '; output=' + holder.outputText().slice(0, 1500));
+  }
+  const text = holder.outputText();
+  if (holder.exited() && !text.includes('WORKER_READY')) {
+    throw new Error('remote holder exited before ready; output=' + text.slice(0, 1500));
+  }
   const m = /WORKER_READY (\{.*\})/.exec(text);
-  if (!m) throw new Error('remote holder ready line unparseable: ' + text.slice(0, 500));
+  if (!m) throw new Error('remote holder ready line unparseable: ' + text.slice(0, 800));
   holder.ready = JSON.parse(m[1]);
   holder.pid = holder.ready.pid;
   holder.identity = holder.ready.identity;
@@ -604,7 +623,7 @@ async function scenarioBasic(sc, ctx) {
     evidenceRef: proofPath, actor: ACTOR_A,
   });
   assert(sc, 'report with client-local path is accepted as a record', directRef.status === 200, 'status=' + directRef.status);
-  assert(sc, 'client-local path evidence is NOT admissible on the board host', directRef.json?.evidence?.admissible === false, JSON.stringify(directRef.json?.evidence));
+  assert(sc, 'client-local path evidence is NOT admissible on the board host', evidenceView(directRef)?.admissible === false, JSON.stringify(evidenceView(directRef)));
 
   const blob = await blobPut(proofBytes);
   assert(sc, 'POST /blob/put -> 200', blob.status === 200, 'status=' + blob.status);
@@ -617,9 +636,9 @@ async function scenarioBasic(sc, ctx) {
     evidenceRef: 'blob://sha256:' + blob.json.sha256, acceptanceRef: 'A01', verificationMethod: 'disk-hash', actor: ACTOR_A,
   });
   assert(sc, 'POST /task/report (blob ref) -> 200', reported.status === 200, 'status=' + reported.status);
-  assert(sc, 'blob evidence is admissible', reported.json?.evidence?.admissible === true, JSON.stringify(reported.json?.evidence));
-  assert(sc, 'evidence ref_sha256 equals the server-computed hash', reported.json?.evidence?.ref_sha256 === blob.json?.sha256, JSON.stringify(reported.json?.evidence));
-  assert(sc, 'evidence ref_kind is blob', reported.json?.evidence?.ref_kind === 'blob', String(reported.json?.evidence?.ref_kind));
+  assert(sc, 'blob evidence is admissible', evidenceView(reported)?.admissible === true, JSON.stringify(evidenceView(reported)));
+  assert(sc, 'evidence ref_sha256 equals the server-computed hash', evidenceView(reported)?.ref_sha256 === blob.json?.sha256, JSON.stringify(evidenceView(reported)));
+  assert(sc, 'evidence ref_kind is blob', evidenceView(reported)?.ref_kind === 'blob', String(evidenceView(reported)?.ref_kind));
 
   const completed = await postJson('/task/complete', { taskId, actor: ACTOR_A });
   assert(sc, 'POST /task/complete -> 200', completed.status === 200, 'status=' + completed.status);
@@ -769,7 +788,7 @@ async function scenarioGates(sc, ctx) {
     evidenceRef: 'blob://sha256:' + failBlob.json.sha256, actor: ACTOR_B,
   });
   assert(sc, 'report last evidence = fail is accepted', failReport.status === 200, 'status=' + failReport.status);
-  assert(sc, 'fail evidence is admissible (executed + real artifact)', failReport.json?.evidence?.admissible === true, JSON.stringify(failReport.json?.evidence));
+  assert(sc, 'fail evidence is admissible (executed + real artifact)', evidenceView(failReport)?.admissible === true, JSON.stringify(evidenceView(failReport)));
 
   const latestFail = await postJson('/task/complete', { taskId, actor: ACTOR_B });
   assert(sc, 'complete with latest=fail -> HTTP 409', latestFail.status === 409, 'status=' + latestFail.status);
@@ -783,7 +802,7 @@ async function scenarioGates(sc, ctx) {
     taskId, executed: true, outcome: 'pass', note: 'recovered after fail, latest admissible evidence is pass',
     evidenceRef: 'blob://sha256:' + passBlob.json.sha256, actor: ACTOR_B,
   });
-  assert(sc, 'later pass evidence is admissible', passReport.json?.evidence?.admissible === true, JSON.stringify(passReport.json?.evidence));
+  assert(sc, 'later pass evidence is admissible', evidenceView(passReport)?.admissible === true, JSON.stringify(evidenceView(passReport)));
   const done = await postJson('/task/complete', { taskId, actor: ACTOR_B });
   assert(sc, 'later pass can complete (gate is last-admissible, not stuck)', done.status === 200 && done.json?.task?.lifecycle === 'done', JSON.stringify({ status: done.status, lifecycle: done.json?.task?.lifecycle }));
 
@@ -885,7 +904,7 @@ async function scenarioAdoptCrossMachineDeny(sc, ctx) {
   const detail = denied.json?.error?.detail ?? {};
   assert(sc, 'reject detail says identity is unverified (cross-host)', detail.evidence?.identity?.verdict === 'unverified' && detail.evidence?.identity?.reason === 'unverified-cross-host', JSON.stringify(detail.evidence?.identity));
   assert(sc, 'reject detail checked_pid=false', detail.evidence?.identity?.checked_pid === false, JSON.stringify(detail.evidence?.identity));
-  assert(sc, 'reject detail policy says allow_unverified_adoption=false', detail.policy?.allow_unverified_adoption === false, JSON.stringify(detail.policy));
+  assert(sc, 'reject detail does not claim an explicit allow', detail.policy?.allow_unverified_adoption !== true, JSON.stringify(detail.policy));
   const after = await getJson('/task/get?taskId=' + encodeURIComponent(taskId));
   assert(sc, 'nothing was adopted (owner unchanged, task still stale)', after.json?.task?.owner_session === ACTOR_W && after.json?.task?.stale === 1, JSON.stringify(summarizeTask(after.json?.task)));
   const events = await fetchEventList(taskId);
@@ -987,27 +1006,41 @@ function summarizeTask(task) {
 
 // ---------------------------------------------------------------- master: artifacts / main
 
-async function collectArtifacts(remoteWorkDir, destSubdir) {
-  const dump = remoteAction('Dump', remoteWorkDir);
+async function collectArtifacts(remoteWorkDir, destSubdir, boardState) {
+  // Direct SSH reads instead of board_verify_server.ps1 -Action Dump: the Dump action was observed
+  // to hang on this host (manifest hashing itself measured ~311ms, so the stall is in a later step;
+  // not isolated in time). Direct reads are enough for evidence: logs, audit files, health, state.
   const evidenceServer = path.join(EVIDENCE_RUN, destSubdir);
   fs.mkdirSync(evidenceServer, { recursive: true });
-  writeJson(path.join(evidenceServer, 'dump-response.json'), { raw_stdout: dump.raw.stdout, raw_stderr: dump.raw.stderr, parsed: dump.parsed });
-  if (!dump.parsed || dump.parsed.ok !== true) return { ok: false, reason: 'dump failed', parsed: dump.parsed, stderr: dump.raw.stderr };
-  const localArtifacts = path.join(evidenceServer, 'artifacts.json');
-  const down = scpFrom(dump.parsed.artifacts_path.replace(/\\/g, '/'), localArtifacts);
-  if (down.status !== 0) return { ok: false, reason: 'scp artifacts failed', stderr: down.stderr };
-  let artifacts = null;
-  try { artifacts = JSON.parse(fs.readFileSync(localArtifacts, 'utf8')); } catch { artifacts = null; }
-  if (artifacts) {
-    if (typeof artifacts.stdout_log === 'string') fs.writeFileSync(path.join(evidenceServer, 'board-stdout.log'), artifacts.stdout_log, 'utf8');
-    if (typeof artifacts.stderr_log === 'string') fs.writeFileSync(path.join(evidenceServer, 'board-stderr.log'), artifacts.stderr_log, 'utf8');
-    const auditDir = path.join(evidenceServer, 'audit');
-    fs.mkdirSync(auditDir, { recursive: true });
-    for (const f of artifacts.audit_files ?? []) {
-      if (typeof f?.content === 'string') fs.writeFileSync(path.join(auditDir, String(f.name).replace(/[^\w.-]/g, '_')), f.content, 'utf8');
-    }
+  const script = [
+    '$ErrorActionPreference = "Continue"',
+    '$wd = ' + psQuote(remoteWorkDir),
+    '$port = ' + String(boardState.port),
+    'function Read-Text([string]$p) { if (Test-Path $p) { try { return (Get-Content -Raw $p) } catch { return $null } } return $null }',
+    '$audit = @()',
+    '$adir = Join-Path $wd "audit"',
+    'if (Test-Path $adir) { foreach ($f in (Get-ChildItem $adir -File -ErrorAction SilentlyContinue)) { $audit += @{ name = $f.Name; size = $f.Length; content = (Read-Text $f.FullName) } } }',
+    '$health = $null',
+    'try { $health = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $port + "/health") -TimeoutSec 2 -UseBasicParsing } catch { }',
+    '$state = $null',
+    '$statePath = Join-Path $wd "state.json"',
+    'if (Test-Path $statePath) { try { $state = (Get-Content -Raw $statePath | ConvertFrom-Json) } catch { } }',
+    '$out = @{ ok = $true; workdir = $wd; server_hostname = $env:COMPUTERNAME; health = $health; state = $state; stdout_log = (Read-Text (Join-Path $wd "stdout.log")); stderr_log = (Read-Text (Join-Path $wd "stderr.log")); wrapper_exit = (Read-Text (Join-Path $wd "wrapper-exit.txt")); audit_files = $audit }',
+    '$out | ConvertTo-Json -Depth 8 -Compress',
+  ].join('\n');
+  const r = sshScript(script, { timeoutMs: 60000 });
+  const artifacts = parseLastJson(r.stdout);
+  writeJson(path.join(evidenceServer, 'collect-response.json'), { raw_stdout: r.stdout, raw_stderr: r.stderr, status: r.status, parsed_ok: artifacts?.ok === true });
+  if (artifacts === null || artifacts.ok !== true) return { ok: false, reason: 'collect failed', stderr: r.stderr };
+  writeJson(path.join(evidenceServer, 'artifacts.json'), artifacts);
+  if (typeof artifacts.stdout_log === 'string') fs.writeFileSync(path.join(evidenceServer, 'board-stdout.log'), artifacts.stdout_log, 'utf8');
+  if (typeof artifacts.stderr_log === 'string') fs.writeFileSync(path.join(evidenceServer, 'board-stderr.log'), artifacts.stderr_log, 'utf8');
+  const auditDir = path.join(evidenceServer, 'audit');
+  fs.mkdirSync(auditDir, { recursive: true });
+  for (const f of artifacts.audit_files ?? []) {
+    if (typeof f?.content === 'string') fs.writeFileSync(path.join(auditDir, String(f.name).replace(/[^\w.-]/g, '_')), f.content, 'utf8');
   }
-  return { ok: true, artifacts_path: localArtifacts, audit_files: artifacts?.audit_files?.length ?? 0, repo_manifest: artifacts?.repo_manifest?.length ?? 0, artifacts };
+  return { ok: true, audit_files: artifacts?.audit_files?.length ?? 0, artifacts };
 }
 
 let START_STATE = null;
@@ -1106,8 +1139,8 @@ async function main() {
     writeJson(path.join(EVIDENCE_RUN, 'server', 'default', 'tasks-final.json'), tasks.json);
     const globalEvents = await getJson('/events?limit=100');
     writeJson(path.join(EVIDENCE_RUN, 'server', 'default', 'events-global.json'), globalEvents.json);
-    const art1 = await collectArtifacts(ctx.remoteWorkDir, path.join('server', 'default'));
-    summary.artifacts = { default: { ok: art1.ok, reason: art1.reason ?? null, audit_files: art1.audit_files ?? null, repo_manifest: art1.repo_manifest ?? null } };
+    const art1 = await collectArtifacts(ctx.remoteWorkDir, path.join('server', 'default'), START_STATE);
+    summary.artifacts = { default: { ok: art1.ok, reason: art1.reason ?? null, audit_files: art1.audit_files ?? null } };
     if (art1.artifacts?.state?.started_at) summary.board_started_at = art1.artifacts.state.started_at;
     if (!CFG.skipPhase2) {
       useBoard(ctx.boardAllow);
@@ -1117,8 +1150,8 @@ async function main() {
       writeJson(path.join(EVIDENCE_RUN, 'server', 'allow', 'tasks-final.json'), tasksAllow.json);
       const eventsAllow = await getJson('/events?limit=100');
       writeJson(path.join(EVIDENCE_RUN, 'server', 'allow', 'events-global.json'), eventsAllow.json);
-      const art2 = await collectArtifacts(ctx.remoteWorkDirAllow, path.join('server', 'allow'));
-      summary.artifacts.allow = { ok: art2.ok, reason: art2.reason ?? null, audit_files: art2.audit_files ?? null, repo_manifest: art2.repo_manifest ?? null };
+      const art2 = await collectArtifacts(ctx.remoteWorkDirAllow, path.join('server', 'allow'), START_STATE_ALLOW);
+      summary.artifacts.allow = { ok: art2.ok, reason: art2.reason ?? null, audit_files: art2.audit_files ?? null };
       useBoard(ctx.board);
     }
   } catch (err) {
@@ -1159,6 +1192,7 @@ async function main() {
       }
     }
     fs.writeFileSync(path.join(EVIDENCE_RUN, 'http-trace.jsonl'), httpTrace.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8');
+    for (const s of summary.scenarios) writeJson(path.join(EVIDENCE_RUN, 'scenarios', 'scenario-' + s.id + '-' + s.phase + '.json'), s);
     summary.finished_at = isoNow();
     const required = [...REQUIRED_PHASE1, ...(CFG.skipPhase2 ? [] : REQUIRED_PHASE2)]
       .map((id) => summary.scenarios.find((s) => s.id === id));

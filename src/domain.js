@@ -484,7 +484,7 @@ function describeUnverifiedIdentity(reason, ev) {
   }
 }
 
-function adoptionRejected(code, reasons, evidence) {
+function adoptionRejected(code, reasons, evidence, policy) {
   return {
     allowed: false,
     code,
@@ -493,6 +493,9 @@ function adoptionRejected(code, reasons, evidence) {
     unverified: false,
     verdict: 'rejected',
     evidence: evidence ?? {},
+    // 拒绝也要带策略快照：排查时第一个问题就是"是没配放行，还是配了但被别的证据挡住"。
+    // 只放在成功响应里，等于让最关键的那次拒绝恰好没有上下文（verifier 实测抓到的缺口）。
+    policy: policy ?? { allow_unverified_adoption: false },
   };
 }
 
@@ -527,7 +530,9 @@ function adoptionRejected(code, reasons, evidence) {
  * @param {boolean} [input.allowUnverifiedAdoption] 跨机/缺身份时是否放行（默认 false = 严格）
  * @param {boolean} [input.eventScanTruncated] 事件扫描是否被截断（真值时"找不到租约事件"不许当成证据）
  * @returns {{allowed:boolean, code:string|null, message:string, reasons:string[],
- *            unverified:boolean, verdict:string, evidence:object, policy?:object}}
+ *            unverified:boolean, verdict:string, evidence:object, policy:object}}
+ *          注意 `policy` 在**拒绝时也一定存在**（{allow_unverified_adoption:boolean}），
+ *          否则排查时无法区分"策略没放行"与"被别的证据挡住"。
  */
 export function evaluateAdoption(input = {}) {
   const {
@@ -539,18 +544,21 @@ export function evaluateAdoption(input = {}) {
     eventScanTruncated = false,
   } = input;
   const at = Number.isFinite(Number(input.now)) ? Number(input.now) : Date.now();
+  // 策略快照只算一次：成功与拒绝都带上它，口径不会漂
+  const policy = { allow_unverified_adoption: allowUnverifiedAdoption === true };
+  const reject = (code, reasons, evidence) => adoptionRejected(code, reasons, evidence, policy);
 
   if (task === null || task === undefined) {
-    return adoptionRejected('TASK_NOT_FOUND', ['任务不存在']);
+    return reject('TASK_NOT_FOUND', ['任务不存在']);
   }
   if (TERMINAL.has(task.lifecycle)) {
-    return adoptionRejected('TASK_CLOSED', [`任务已终结（${task.lifecycle}），不能再被收养`]);
+    return reject('TASK_CLOSED', [`任务已终结（${task.lifecycle}），不能再被收养`]);
   }
   if (task.owner_session === null || task.owner_session === undefined) {
-    return adoptionRejected(ADOPT_CODES.NOT_CLAIMED, ['任务还没有负责人，不存在"接管"这回事 —— 直接 claim 即可']);
+    return reject(ADOPT_CODES.NOT_CLAIMED, ['任务还没有负责人，不存在"接管"这回事 —— 直接 claim 即可']);
   }
   if (!['claimed', 'working', 'blocked'].includes(task.lifecycle)) {
-    return adoptionRejected(ADOPT_CODES.STATE_INVALID, [
+    return reject(ADOPT_CODES.STATE_INVALID, [
       `任务状态是 ${task.lifecycle}，只有 claimed / working / blocked 的租约可以被收养`,
     ]);
   }
@@ -568,7 +576,7 @@ export function evaluateAdoption(input = {}) {
     overrun_ms: leaseUntil === null ? null : at - leaseUntil,
   };
   if (!(staleFlag || expired)) {
-    return adoptionRejected(
+    return reject(
       ADOPT_CODES.NOT_STALE,
       [
         `租约还没有过期（lease_until=${leaseUntil === null ? 'NULL' : new Date(leaseUntil).toISOString()}，` +
@@ -632,7 +640,7 @@ export function evaluateAdoption(input = {}) {
     }
   }
   if (holderAlive) {
-    return adoptionRejected(
+    return reject(
       ADOPT_CODES.HOLDER_ALIVE,
       [
         `租约持有者（${task.owner_session}）的进程还在同机运行（pid=${leasePid}${identityEvidence.reason === 'self' ? '，就是判定者自己' : ''}）：` +
@@ -662,7 +670,7 @@ export function evaluateAdoption(input = {}) {
   };
   const evidenceSoFar = { time: timeEvidence, identity: identityEvidence, event: eventEvidence };
   if (eventScanTruncated && leaseEvents.length === 0) {
-    return adoptionRejected(
+    return reject(
       ADOPT_CODES.EVIDENCE_INSUFFICIENT,
       [
         `事件扫描被截断（只看最近 ${eventEvidence.scanned} 条）且其中没有任何租约类事件：` +
@@ -672,7 +680,7 @@ export function evaluateAdoption(input = {}) {
     );
   }
   if (last === null) {
-    return adoptionRejected(
+    return reject(
       ADOPT_CODES.EVIDENCE_INSUFFICIENT,
       [
         '审计流里找不到任何租约类事件（claim / renew / heartbeat / revived）：' +
@@ -682,14 +690,14 @@ export function evaluateAdoption(input = {}) {
     );
   }
   if (leaseUntil === null) {
-    return adoptionRejected(
+    return reject(
       ADOPT_CODES.EVIDENCE_INSUFFICIENT,
       ['任务有负责人但没有 lease_until：无法把事件时间与租约期限对齐'],
       evidenceSoFar,
     );
   }
   if (!lastBefore) {
-    return adoptionRejected(
+    return reject(
       ADOPT_CODES.EVIDENCE_INSUFFICIENT,
       [
         `最后一条租约类事件是 ${eventEvidence.last_kind} @${new Date(eventEvidence.last_at).toISOString()}，` +
@@ -699,7 +707,7 @@ export function evaluateAdoption(input = {}) {
     );
   }
   if (renewalsAfter.length > 0) {
-    return adoptionRejected(
+    return reject(
       ADOPT_CODES.EVIDENCE_INSUFFICIENT,
       [
         `lease_until 之后还有 ${renewalsAfter.length} 条租约类事件：原持有者在"过期"之后仍有续租痕迹，` +
@@ -711,9 +719,8 @@ export function evaluateAdoption(input = {}) {
 
   // ── 结论：三证据齐了。身份是不是"已验证"决定这是不是一次未验证收养 ──
   const unverified = identityVerified !== true;
-  const policy = { allow_unverified_adoption: allowUnverifiedAdoption === true };
   if (unverified && allowUnverifiedAdoption !== true) {
-    return adoptionRejected(
+    return reject(
       ADOPT_CODES.EVIDENCE_UNVERIFIABLE,
       [
         `身份证据无法验证：${describeUnverifiedIdentity(identityEvidence.reason, identityEvidence)}`,

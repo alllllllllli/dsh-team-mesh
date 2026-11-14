@@ -70,7 +70,8 @@
 - 拒绝码是稳定契约：`ADOPT_NOT_STALE` / `ADOPT_HOLDER_ALIVE` / `ADOPT_EVIDENCE_INSUFFICIENT` /
   `ADOPT_EVIDENCE_UNVERIFIABLE` / `ADOPT_NOT_CLAIMED` / `ADOPT_STATE_INVALID`（HTTP 层统一 `409`）。
 - **默认严格**：身份无法验证就拒绝。确认风险后要放行时：单机插件配 `allowUnverifiedAdoption: true`
-  （默认 `false`），板服务设 `DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT=1`。放行后 `lease.adopted` 事件
+  （默认 `false`），板服务设 `DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT=1`（`1/true/yes/on` 均可，
+  解析口径见「实现说明」）。放行后 `lease.adopted` 事件
   payload 里 `unverified=true`、`verdict="adopted-unverified"`，工具返回文本也醒目标注 ——
   **不把未验证写成已验证**。远端模式下放行策略只由板服务决定，客户端无法自我授权。
 - 成功收养落 `lease.adopted` 审计事件：含原负责人 / 原租约身份、三类证据原文、`verdict`、`policy`；
@@ -86,17 +87,22 @@
 - 工具总数 **12 → 13**（新增 `mesh_task_adopt`）；注册名以 `src/spec.js` 的 `TOOL_NAMES` 为准。
 - `docs/dev/changelog-core.md` / `changelog-board.md` / `changelog-adoption.md` 三份开发期变更片段
   保留在仓库里作为过程材料，对外说明以本文件为准。
+- 0.4.0 已提交进 server 权威仓（commit `80156d8`，23 文件 +6518/−43）；该仓原地全量单测
+  239 / 239 通过。
 
 ### 已验证（本工作副本实跑）
 
 | 项 | 结果 |
 | --- | --- |
-| 单测（15 个文件） | **239 / 239 通过**，0 失败（约 44–45s） |
+| 单测（15 个文件） | **244 / 244 通过**，0 失败（约 46–60s，含 P1/P2 修复新增的 5 条） |
 | `tools/e2e_remote.mjs` | 24 / 24 通过 |
 | `tools/e2e_v2.mjs` | 29 / 29 通过 |
+| **双机独立验证**（真实 mcloud ↔ server 两台机器） | **8 / 8 场景、154 / 154 断言通过，exit 0**（证据 `verify/evidence/run-20261114171435-364d85609d/`；逐条见下文「双机交叉验证」节） |
 
-说明：本次发布收口**只改版本号与文档**，不改功能代码；上面的测试是收口后重跑的
-（与三块功能各自交付时的结果一致）。
+说明：本次发布收口**只改版本号与文档**，不改功能代码；上面的单测 / e2e 是收口后重跑的。
+双机验证用的是 server 上的**临时板**（随机端口、临时库、随机 token，`DSH_TEAM_BOARD_SWEEP_MS=0`），
+客户端是 mcloud 上的独立 Node 进程 —— **不是两台真实 DSH 宿主**，`mesh_dispatch` 经 interconnect 投递
+那一段未在双机验证里覆盖（见"未验证"第 2 条）。
 
 ### 未验证（诚实边界，别当成已支持）
 
@@ -104,22 +110,73 @@
    字段是对着装好的 `app.asar`（`@deepseek-ai/dsh-api-session-controller`）编译产物逐行核对的，
    并用契约锁测试钉住"prompt 必须传 AbortSignal"；但新会话是否真的接受 `mode:'queue'` 的首次 prompt、
    是否真的起跑并最终 ack，**未在活宿主实测**。症状会是"建出了子会话但子会话不动"。
-2. **生产板服务未换新代码**：GC / 落盘审计 / 限流 / 监听地址字段 / `POST /task/adopt` 需**部署 + 重启
+2. **双机验证不是"两个真实 DSH 宿主"**：验证里的客户端是 mcloud 上的独立 Node 进程（`RemoteBoard` /
+   裸 HTTP），`mesh_dispatch` 经 interconnect 投递到对端 DSH 会话这一段仍未在双机上覆盖。
+3. **生产板服务未换新代码**：GC / 落盘审计 / 限流 / 监听地址字段 / `POST /task/adopt` 需**部署 + 重启
    板服务**后才生效；本版没有部署、没有重启生产（13090）。
-3. **生产库上的真实 GC 未执行**：会删多少、删后有无下游引用报"板上没有这个内容寻址对象"，
+4. **生产库上的真实 GC 未执行**：会删多少、删后有无下游引用报"板上没有这个内容寻址对象"，
    只给了只读预检 SQL（见板服务硬化报告），没在生产库跑。
-4. **0.4 的三块功能都没有变异测试（mutation）**：dispatcher / 板硬化 / adopt 只有针对性用例与断言，
+5. **0.4 的三块功能都没有变异测试（mutation）**：dispatcher / 板硬化 / adopt 只有针对性用例与断言，
    "这些用例真的会变红"没有变异证明（既有 mutation 脚本没扩展）。
-5. **真实双机跨机收养未实测**：跨机边界是用"伪造 `lease_host` 的另一台主机名 + 真实 HTTP"模拟的，
-   E2 只比较主机名字符串，这是它能验证的最大范围。
-6. **板服务长期运行未验**：没有长跑（内存 / 连接泄漏）、没有审计跨天滚动、没有高并发限流压测；
-   审计是"尽力而为"（append 不 fsync，崩溃可能丢最后几行）；限流是固定窗口（边界允许 2 倍突发）。
-7. **Linux / macOS 未验**：本版范围只要 Windows。
+6. **真实 OS 级 PID 复用**：双机验证用"同 pid + 不同 start_sec"精确触发了 `PID_REUSED` 判定分支
+   （等价输入），但没有制造操作系统把同一 pid 真分配给新进程的巧合（不可控、低概率）；建议以单元测试
+   注入覆盖为准。
+7. **板服务在租约存续期间重启**：板进程身份变化对 stale / 先占判定的影响，未在两机场景覆盖。
+8. **进程内定时 sweep 路径**：双机验证用确定性显式 `POST /sweep`（`DSH_TEAM_BOARD_SWEEP_MS=0`）；
+   `>0` 的定时器长驻路径未跑。
+9. **A1 审计 JSONL 原始文件未进证据**：双机验证的板审计 `.jsonl` 原始文件因远程采集一次超时未进入证据
+   目录；审计事实改以 `/events` HTTP 导出为准（覆盖了全部断言）。这是证据链缺口，不是产品缺陷。
+10. **板服务长期运行未验**：没有长跑（内存 / 连接泄漏）、没有审计跨天滚动、没有高并发限流压测；
+    审计是"尽力而为"（append 不 fsync，崩溃可能丢最后几行）；限流是固定窗口（边界允许 2 倍突发）。
+11. **Linux / macOS 未验**：本版范围只要 Windows。
 
-### 两机交叉验证（进行中，结论待补）
+### 双机交叉验证（已完成：8 / 8 场景、154 / 154 断言）
 
-双机（两台互相独立的 DSH + 真实隧道 + 同一块板）交叉验证**仍在进行中**，报告未完成。
-在结论补齐之前，本版**不声称**双机闭环已验证 —— 已有结论见上一节"未验证"第 1、5 条。
+真实双机：客户端 mcloud ↔ 板服务 server（LAN 直连）；server 上起**临时板**（随机高位端口、临时库、
+随机 token，审计落盘开启，`DSH_TEAM_BOARD_SWEEP_MS=0` 由测试显式 `POST /sweep` 驱动）。
+**阶段一 4/4 + 阶段二 4/4，154/154 断言通过，exit 0**；证据目录
+`verify/evidence/run-20261114171435-364d85609d/`（`summary.json` overall=PASS、`exit-code.txt`=0）。
+逐条：
+
+1. **跨机闭环**：`lease_host` = 客户端主机名、≠ 板服务主机名；服务端实算 sha256 与客户端本地一致；
+   反向对照 —— 客户端本机绝对路径当 `evidenceRef` 会被判不可采信（跨机必须走内容寻址）；门禁放行、任务 `done`。
+2. **真实进程崩溃 → stale → 接管**：`taskkill /F` 真杀 worker 子进程；租约未到期时 claim → 409
+   `ALREADY_CLAIMED`（不提前抢活）；到期 sweep 标 stale（跨机只认时间：`overrun_ms` 248ms、无 `reason`）；
+   接管留 `lease.taken_over`（`stale=true`、`prev_lease_pid/start_sec` 完整），heartbeat 后 `was_stale=false`。
+3. **PID 复用被拒**：两种形态（冒用旧 owner 身份 / 同 pid 不同 start_sec）均 400 `PID_REUSED`，拒绝无副作用。
+4. **完成门禁不放松**：无证据 → 409 `NO_EVIDENCE` + `task.gate_rejected`；最后一条可采信证据为 `fail` →
+   409 `LATEST_FAIL`；补一条可采信 `pass` 后可完成（语义是"最后一条可采信证据"，不会永久卡死）。
+5. **同机收养 verified**：持有者跑在板服务同机，硬杀后 sweep 走 **dead-holder 分支**
+   （`dead_owner_count=1`、`reason=holder-pid-gone`、`overrun_ms` 为负 = 租约时间没到、按"进程死了"判）；
+   `POST /task/adopt` → 200：`unverified=false`、`checked_pid=true`、`verdict=adopted-verified`；
+   `lease.adopted` 带三类证据与 `prev_lease_pid/lease_host`；任务 owner 更新、stale 清除。
+6. **跨机收养默认拒绝**：跨机只认时间（`dead_owner_count=0, expired_count=1`）；`POST /task/adopt` → 409
+   `ADOPT_EVIDENCE_UNVERIFIABLE`（`reason=unverified-cross-host`、`checked_pid=false`、`verdict=unverified`）；
+   拒绝后 owner 不变、任务仍 stale、**无 `lease.adopted` 事件**。
+7. **显式放行（未验证收养）**：另起一块设放行策略的板（`/health.adoption.allow_unverified=true`），
+   同样跨机场景 `POST /task/adopt` → 200，但返回与审计**都明确标注未验证**：`unverified=true`、
+   `verdict=adopted-unverified`、`checked_pid=false`、`policy.allow_unverified_adoption=true`；
+   不存在任何"看起来已验证"的字段。
+8. **收养拒绝路径**：租约有效 → 409 `ADOPT_NOT_STALE`；任务未认领 → 409 `ADOPT_NOT_CLAIMED`；
+   同机持有者仍活 → 409 `ADOPT_HOLDER_ALIVE`；随后真杀该持有者，同一任务再 adopt → 200 `adopted-verified`
+   （**拒绝不是永久的，判定随事实变化**）。
+
+诚实边界：验证客户端是**独立 Node 进程**而非真实 DSH 宿主，`mesh_dispatch`/interconnect 链路未覆盖；
+临时板不是生产 13090 —— 生产部署/重启与生产库 GC 仍未做（见"未验证"第 3、4 条）。
+
+### 实现说明（P1 取值口径与 P2 可观测性已在本次发布前修正）
+
+两机验证抓到两个实现缺口，**修复都合入同一个 0.4.0**（不另升版本号）：
+
+- **P1 取值口径（已修正）**：早期解析只认 `true`（`src/server.js` 用 `toLowerCase() === 'true'`），
+  而文档与启动日志写的是 `=1` —— 按文档配置却不生效，会把"默认拒绝"误判成"已放行"
+  （安全方向是更严，但会造成误判与排障干扰）。**现在接受 `1 / true / yes / on`**（trim + 小写），
+  与文档口径一致。
+- **P2 可观测性（已修正）**：`ADOPT_EVIDENCE_UNVERIFIABLE` 的拒绝响应 detail 现在与成功响应同口径
+  带 `policy.allow_unverified_adoption`（`domain.js` 的策略快照对成功 / 拒绝只算一次、两处共用），
+  调用方可以从拒绝响应直接区分"策略没放行"与"被别的证据挡住"。
+
+这两条都是 verifier 在两机验证里实测发现、并在本次发布前修掉的；0.4.0 只有这一个版本号。
 
 ### 升级与回滚
 

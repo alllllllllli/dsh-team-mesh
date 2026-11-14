@@ -32,7 +32,7 @@ param(
   [int]$Port = 0,
   [string]$ClientIp = '172.24.112.11',
   [string]$Root = 'C:\Users\admin\mesh-verify',
-  [string]$AllowUnverifiedAdopt = ''   # '' = do not set the env var; '1' = set it for this board
+  [string]$AllowUnverifiedAdopt = ''   # '' = do not set the env var; otherwise the value is passed to DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT
 )
 
 $ErrorActionPreference = 'Stop'
@@ -90,7 +90,7 @@ function Test-PortListening([int]$p) {
 
 function Get-Health([int]$p) {
   try {
-    return Invoke-RestMethod -Uri ("http://127.0.0.1:" + $p + "/health") -TimeoutSec 3 -UseBasicParsing
+    return Invoke-RestMethod -Uri ("http://127.0.0.1:" + $p + "/health") -TimeoutSec 1 -UseBasicParsing
   } catch {
     return $null
   }
@@ -195,17 +195,17 @@ switch ($Action) {
     $lines = @(
       '@echo off',
       ('cd /d "' + $RepoPath + '"'),
-      ('echo started>&"' + $startedMarker + '"'),
-      ('set /p DSH_TEAM_BOARD_TOKEN=<"' + $tokenFile + '"'),
+      ('echo started> "' + $startedMarker + '"'),
+      ('set /p DSH_TEAM_BOARD_TOKEN=< "' + $tokenFile + '"'),
       ('set "DSH_TEAM_BOARD_PORT=' + [string]$port + '"'),
       'set "DSH_TEAM_BOARD_HOST=0.0.0.0"',
       ('set "DSH_TEAM_BOARD_DB=' + $dbPath + '"'),
       ('set "DSH_TEAM_BOARD_AUDIT_DIR=' + $auditDir + '"'),
       'set "DSH_TEAM_BOARD_SWEEP_MS=0"'
     )
-    if ($AllowUnverifiedAdopt -eq '1') { $lines += 'set "DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT=1"' }
+    if (-not [string]::IsNullOrWhiteSpace($AllowUnverifiedAdopt)) { $lines += ('set "DSH_TEAM_BOARD_ALLOW_UNVERIFIED_ADOPT=' + $AllowUnverifiedAdopt + '"') }
     $lines += ('"' + $NodeExe + '" src\server.js 1>"' + $stdoutLog + '" 2>"' + $stderrLog + '"')
-    $lines += ('echo %ERRORLEVEL%>"' + $exitFile + '"')
+    $lines += ('echo %ERRORLEVEL%> "' + $exitFile + '"')
     Set-Content -Path $wrapper -Value ($lines -join "`r`n") -Encoding ascii
 
     $ruleAdded = $false
@@ -229,10 +229,11 @@ switch ($Action) {
     $wrapperPid = [int]$created.ProcessId
 
     $health = $null
-    for ($i = 0; $i -lt 80; $i++) {
-      Start-Sleep -Milliseconds 250
+    $deadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $deadline) {
       $health = Get-Health $port
       if ($null -ne $health) { break }
+      Start-Sleep -Milliseconds 200
     }
     if ($null -eq $health) {
       $diag = @(
@@ -283,7 +284,7 @@ switch ($Action) {
       wrapper_path             = $wrapper
       started_at               = $startedAt
       sweep_ms                 = 0
-      allow_unverified_adopt   = ($AllowUnverifiedAdopt -eq '1')
+      allow_unverified_adopt   = (-not [string]::IsNullOrWhiteSpace($AllowUnverifiedAdopt))
       host                     = $env:COMPUTERNAME
     }
     Write-State $state $wd
@@ -301,7 +302,7 @@ switch ($Action) {
       token_file             = $tokenFile
       repo_path              = $RepoPath
       node_exe               = $NodeExe
-      allow_unverified_adopt = ($AllowUnverifiedAdopt -eq '1')
+      allow_unverified_adopt = (-not [string]::IsNullOrWhiteSpace($AllowUnverifiedAdopt))
       health                 = $health
     }
     exit 0
