@@ -307,6 +307,41 @@ export class LocalSqliteBackend {
     return this.addColumnsIfMissing('evidence', EVIDENCE_V4_COLUMNS);
   }
 
+  /**
+   * 读**库里记录的** schema 版本（`meta.schema_version`）。
+   *
+   * 存在的理由：`/health` 原来把这个字段写死成 `1`，而库里真实值是 4，
+   * 于是它成了**假判据** —— 谁想用它确认板服务加载了哪版代码都会被误导。
+   * 现在改成从库里读，SQL 只允许出现在这一层（分层：路由只搬结论）。
+   *
+   * **不吞错、不回退**：读不到就返回 `version: null` 并带上原因，
+   * 绝不 fallback 成 1 —— 回退成字面量等于把假判据换个写法保留下来。
+   *
+   * @returns {{version: number|null, raw: string|null, present: boolean, error: string|null}}
+   *   `version` 只在值是可解析的正整数时才给数；`raw` 是无损的原始字符串；
+   *   `present` 表示这一行是否存在；`error` 为 null 表示"读到了且合法"。
+   */
+  readSchemaVersion() {
+    try {
+      const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
+      if (row === undefined) {
+        return { version: null, raw: null, present: false, error: 'MISSING' };
+      }
+      const raw = row.value === null || row.value === undefined ? null : String(row.value);
+      if (raw === null) {
+        return { version: null, raw: null, present: true, error: 'NULL_VALUE' };
+      }
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n <= 0) {
+        return { version: null, raw, present: true, error: 'NOT_A_POSITIVE_INTEGER' };
+      }
+      return { version: n, raw, present: true, error: null };
+    } catch (err) {
+      // 库被关了 / 文件损坏 / 不是 SQLite：如实说读不到，让 /health 显示 null。
+      return { version: null, raw: null, present: false, error: String(err?.message ?? err) };
+    }
+  }
+
   close() {
     if (this.closed) return;
     this.closed = true;

@@ -115,17 +115,33 @@ function makeRoutes(board) {
   };
 
   const routes = {
-    'GET /health': () => ({
-      ok: true,
-      service: 'dsh-team-mesh board',
-      version: BOARD_SERVICE_VERSION,
-      schema_version: 1,
-      board: board.dbPath ?? null,
-      blobs: board.backend.countBlobs ? board.backend.countBlobs() : null,
-      // P0-1 观测点：不改数据库、不加路由，只把内存里的计数器读出来。
-      // 有它就能证明「定时 sweep 真的在跑」，而不是只能相信代码里有个 setInterval。
-      sweep: { ...sweepState },
-    }),
+    'GET /health': () => {
+      // `schema_version` 必须是**从库里读出来的真值**，不能是字面量。
+      //
+      // 修复的缺陷：这里原来写死 `schema_version: 1`，而库里的真实值是 4。
+      // 后果不是"少了个字段"，而是**假判据** —— 任何人想用 /health 确认板服务
+      // 加载了哪一版代码（含 schema 迁移是否跑过），都会被这个 1 误导。
+      //
+      // 读不到时返回 `null` + `schema_version_error`，**绝不回退成 1**：
+      // fallback 成字面量等于把假判据换个写法保留，仍然会说谎。
+      // `null` 让调用方一眼看出"不知道"，这正是我们想要的可诊断性。
+      //
+      // 注意语义边界：上面那个 `version` 是**板服务的 HTTP 契约版本**
+      //（BOARD_SERVICE_VERSION），跟数据库 schema 无关，这次不动它。
+      const schema = board.schemaVersion();
+      return {
+        ok: true,
+        service: 'dsh-team-mesh board',
+        version: BOARD_SERVICE_VERSION,
+        schema_version: schema.version,
+        schema_version_error: schema.error,
+        board: board.dbPath ?? null,
+        blobs: board.backend.countBlobs ? board.backend.countBlobs() : null,
+        // P0-1 观测点：不改数据库、不加路由，只把内存里的计数器读出来。
+        // 有它就能证明「定时 sweep 真的在跑」，而不是只能相信代码里有个 setInterval。
+        sweep: { ...sweepState },
+      };
+    },
 
     'POST /task/create': (_ctx, _p, body) => {
       const res = board.createTask(

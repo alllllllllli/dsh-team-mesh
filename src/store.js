@@ -111,6 +111,25 @@ export class Board {
     return this.backend.tx(fn);
   }
 
+  /**
+   * 库里记录的 schema 版本（`meta.schema_version`），供 `/health` 报真值。
+   *
+   * 为什么由 Board 转发而不是让 server.js 直接查库：分层不变 —— SQL 只在 backend.js，
+   * 路由层只拿结论。后端若换成远端实现（remote.js），这里也一并指向它自己的后端。
+   *
+   * 读不到时**不回退**任何字面量：返回 `version: null` 并带 `error`，
+   * 让调用方（/health）如实表达"不知道"，而不是伪造一个看起来正常的值。
+   *
+   * @returns {{version: number|null, raw: string|null, present: boolean, error: string|null}}
+   */
+  schemaVersion() {
+    if (typeof this.backend.readSchemaVersion !== 'function') {
+      // 远端后端没实现这个方法时也如实说不知道，不猜。
+      return { version: null, raw: null, present: false, error: 'BACKEND_UNSUPPORTED' };
+    }
+    return this.backend.readSchemaVersion();
+  }
+
   appendEvent(kind, taskId, actor, payload) {
     return this.backend.insertEvent({
       kind,
