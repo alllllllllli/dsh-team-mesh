@@ -102,6 +102,7 @@
 | `tools/e2e_v2.mjs` | 29 / 29 通过 |
 | **双机独立验证**（真实 mcloud ↔ server 两台机器） | **8 / 8 场景、154 / 154 断言通过，exit 0**（证据 `verify/evidence/run-20261114171435-364d85609d/`；逐条见下文「双机交叉验证」节） |
 | **生产板部署**（server 常驻板服务） | 2026-11-15 已重启加载 0.4.0：`/health` 出现 `listen_*`/`gc`/`audit`/`rate_limit`/`adoption` 段，`schema_version=4`，`adoption.allow_unverified=false`；首轮 sweep 回收 1 个无引用孤儿 blob（约 175 小时龄、7775 B），`kept_referenced=6` / `kept_fresh=8` / `remaining=14` / `failures=0`（详见部署记录） |
+| **真实 DSH 宿主（隔离实例）激活（激活层）** | 隔离 `DSH_HOME` + profile 真实启动 0.4.0：stderr 无 pending/failed、`apply()` 跑完（板文件被创建、只读验收 16 项 15 通过）、`src/spec.js` 实测 13 个工具；**只到激活/装配层** —— `已加载：13 个工具` 是 info 日志（CLI 不导出），没有宿主注册表级/模型侧证据，不能据此声称工具已注册到宿主（见 `docs/dev/隔离宿主启动与验证.md`） |
 
 说明：本次发布收口**只改版本号与文档**，不改功能代码；上面的单测 / e2e 是收口后重跑的。
 双机验证用的是 server 上的**临时板**（随机端口、临时库、随机 token，`DSH_TEAM_BOARD_SWEEP_MS=0`），
@@ -110,16 +111,18 @@
 
 ### 未验证（诚实边界，别当成已支持）
 
-1. **真实 DSH 宿主里的总管分流没跑过（隔离实例验证中）**：0.4.0 在真实 DSH 宿主的**加载 / 工具注册**
-   正由隔离实例验证（结论待补）；`sessionController.create()` / `prompt(request, signal)` 的签名与
-   字段是对着装好的 `app.asar`（`@deepseek-ai/dsh-api-session-controller`）编译产物逐行核对的，
-   并用契约锁测试钉住"prompt 必须传 AbortSignal"；但新会话是否真的接受 `mode:'queue'` 的首次 prompt、
-   是否真的起跑并最终 ack，**未在活宿主实测**。症状会是"建出了子会话但子会话不动"。
+1. **真实 DSH 宿主里的总管分流没跑过**：隔离实例已验证 0.4.0 能被真实宿主**激活**（stderr 无
+   pending/failed、`apply()` 跑完），但**没有做模型调用**：`sessionController.create()` /
+   `prompt(request, signal)` 的实际执行、首次 `mode:'queue'` prompt 是否被接受、是否起跑并 ack、
+   是否 spawn 子会话，均未在活宿主实测（签名按 `app.asar` 核对 + 契约锁钉住 AbortSignal）。
+   另：宿主**工具注册表级 / 模型侧工具目录未直接观测**——`已加载：13 个工具` 是 info 日志，CLI 启动下
+   不导出（详见 `docs/dev/隔离宿主启动与验证.md`）。
 2. **双机验证不是"两个真实 DSH 宿主"**：验证里的客户端是 mcloud 上的独立 Node 进程（`RemoteBoard` /
    裸 HTTP），`mesh_dispatch` 经 interconnect 投递到对端 DSH 会话这一段仍未在双机上覆盖。
-3. **插件侧尚未加载 0.4.0**：板服务侧已换新代码并重启（2026-11-15 生效）；server 与 mcloud 的 desktop
-   profile 插件文件已是 0.4.0，但**两边 DSH 未重启**（server 仍是 17:26 那批进程），工具/代码仍是旧版，
-   下次重启才加载。
+3. **插件侧尚未加载 0.4.0**：板服务侧已换新代码并重启（2026-11-15 生效）；三处 desktop profile
+   （server / mcloud / pc-ky614）插件文件都已是 0.4.0，但**三台 DSH 都没重启**，工具/代码仍是旧版，
+   下次重启才加载。重启后判据：**stderr 无 pending/failed 诊断**（不要等 `已加载：13 个工具` info 行，
+   CLI 启动下它本来就不导出）。
 4. **生产库真实 GC 只跑过首轮**：2026-11-15 首次 sweep 回收 1 个无引用孤儿 blob（约 175 小时龄、7775 B）；
    `kept_referenced=6` / `kept_fresh=8` / `remaining=14` / `failures=0`。长期回收节奏、SQLite 文件缩小
    （不会自动缩）与下游引用都仍需观察；被引用的 blob 一个没删。

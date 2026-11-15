@@ -436,8 +436,9 @@ dsh plugin --profile <profile> remove dsh-team-mesh
 | --- | --- | --- |
 | 真实两台物理机（各自独立的 DSH + 真实 SSH 隧道）跨机闭环 | **已验证（0.4.0 双机验证）** | 真实 mcloud ↔ server 两台机器、临时板 + 真实 HTTP：**8/8 场景、154/154 断言通过、exit 0**；证据 `verify/evidence/run-20261114171435-364d85609d/`。注意：验证客户端是独立 Node 进程，不是真实 DSH 宿主（见下一行） |
 | 真实两个 DSH 实例之间的 `mesh_dispatch` | **未实测** | 双机验证的客户端是独立 Node 进程（`RemoteBoard` / 裸 HTTP），没走 `mesh_dispatch` → interconnect → 对端 DSH 会话；需要两个真实 DSH 宿主加载本插件并重启 |
-| 真实 DSH 宿主里的总管分流（`sessionController.create()` / `prompt()`） | **未验证（隔离实例验证中）** | 0.4.0 在真实 DSH 宿主的**加载 / 工具注册**正由隔离实例验证（结论待补，另有报告）；`create()` / `prompt()` 签名按 `app.asar` 核对 + 契约锁钉住 AbortSignal，首次 `mode:'queue'` prompt 行为仍未在活宿主跑。在用 DSH（mcloud / server desktop）插件文件已是 0.4.0 但**未重启**，重启后才真正加载（见 `docs/dev/0.4.0-部署记录-20261115.md`） |
-| 生产板服务换新代码（GC / 落盘审计 / 限流 / `POST /task/adopt`） | **已完成（板服务侧）** | 2026-11-15 生产板已重启加载 0.4.0（新 PID/启动时间见部署记录），GC / 落盘审计 / 限流 / adopt 已生效；`schema_version` 仍 4、`adoption.allow_unverified=false`。两处 desktop profile 的 **DSH 尚未重启**，插件侧仍是旧代码 |
+| 真实 DSH 宿主（隔离实例）的插件加载/激活 | **激活层已验证 / 工具注册表级未观测** | 隔离 `DSH_HOME` + profile 真实启动 0.4.0：stderr 无 pending/failed、`apply()` 跑完（板文件创建、只读验收 16 项 15 通过）、`src/spec.js` 实测 13 个工具；但 `已加载：13 个工具` 是 **info 日志**，CLI 启动下不导出，且无注册表导出/模型调用 → **未拿到宿主工具注册表级证据**。复现见 `docs/dev/隔离宿主启动与验证.md` |
+| 真实 DSH 宿主里的总管分流（`sessionController.create()` / `prompt()`） | **未验证** | 签名按 `app.asar` 核对 + 契约锁钉住 AbortSignal；首次 `mode:'queue'` prompt 是否被接受、是否真的起跑并 ack、是否 spawn 子会话，均未在活宿主跑（隔离实例只验证到激活层与配置解析，无模型调用）。在用 DSH（mcloud / server / pc-ky614）插件文件已是 0.4.0 但**未重启**，重启后才真正加载（见 `docs/dev/0.4.0-部署记录-20261115.md`） |
+| 生产板服务换新代码（GC / 落盘审计 / 限流 / `POST /task/adopt`） | **已完成（板服务侧）** | 2026-11-15 生产板已重启加载 0.4.0（新 PID/启动时间见部署记录），GC / 落盘审计 / 限流 / adopt 已生效；`schema_version` 仍 4、`adoption.allow_unverified=false`。三处 desktop profile（mcloud / server / pc-ky614）的 **DSH 均未重启**，插件侧仍是旧代码 |
 | 生产库上的真实 blob GC（会删多少 / 下游是否报"对象不存在"） | **已完成首轮** | 2026-11-15 首次 sweep 回收 1 个无引用孤儿 blob（约 175 小时龄、7775 B）；`kept_referenced=6` / `kept_fresh=8` / `remaining=14` / `failures=0`。长期回收与磁盘变化仍需观察（被引用的一个没删） |
 | 0.4 三块功能的变异测试（mutation） | **未做** | dispatcher / 板硬化 / adopt 只有针对性用例与断言，既有 mutation 脚本未扩展；"这些用例真的会变红"没有变异证明 |
 | 真实 OS 级 PID 复用 | **未验证** | 双机验证用"同 pid + 不同 start_sec"精确触发 `PID_REUSED` 判定分支（等价输入），没制造 OS 真把同一 pid 分配给新进程的巧合（不可控、低概率）；建议以单测注入覆盖为准 |
@@ -453,7 +454,8 @@ dsh plugin --profile <profile> remove dsh-team-mesh
 > 0.4.0 的双机交叉验证**已完成**（8/8 场景、154/154 断言，见下文「0.4 双机交叉验证」）。
 > 它覆盖的是"真实两台机器 + 真实 HTTP 板 + 真实子进程 worker"，**不等于**"两个真实 DSH 宿主 + interconnect 派活"，
 > 后者仍在表里标未实测。
-> 2026-11-15 生产板已重启加载 0.4.0（板服务侧生效）；两处 desktop profile 的 DSH 未重启，插件侧待重启生效。
+> 2026-11-15 生产板已重启加载 0.4.0（板服务侧生效）；三处 desktop profile 的 DSH 未重启，插件侧待重启生效。
+> 真实宿主加载已用**隔离实例**验证到**激活层**（详见 `docs/dev/隔离宿主启动与验证.md`）。
 > 详见 [`docs/dev/0.4.0-部署记录-20261115.md`](docs/dev/0.4.0-部署记录-20261115.md)。
 
 
