@@ -283,7 +283,7 @@ M3/M4 第一次**没被抓到** —— 因为当时的用例只覆盖了"形状�
 装进隔离 profile 后启动该 profile，**板文件被真实创建**，这是 `apply()` 在宿主里跑成功的硬证据：
 
 ```
-C:\Users\admin\.dsh\team\team.db        4096 B   创建于 18:44:51
+%USERPROFILE%\.dsh\team\team.db        4096 B   创建于 18:44:51
 表: dispatch, event, evidence, meta, sqlite_sequence, task
 meta: [{"key":"schema_version","value":"1"}]
 journal_mode: wal
@@ -459,7 +459,7 @@ dsh plugin --profile <profile> remove dsh-team-mesh
 ### 第 1 层：环境检查（10 秒，随时可跑）
 
 ```powershell
-cd "F:\DeepSeek work space\dsh-team-plugin"
+cd <克隆目录>
 node tools/verify.mjs
 ```
 
@@ -497,7 +497,7 @@ node tools/verify.mjs
 
 ```powershell
 # 另开一个 DSH 实例（比如 headless profile），确认它也有本插件
-dsh plugin --profile headless add "file:F:\DeepSeek work space\dsh-team-plugin"
+dsh plugin --profile <profile> add "file:<克隆目录的绝对路径>"
 ```
 
 然后在会话里：
@@ -514,7 +514,7 @@ dsh plugin --profile headless add "file:F:\DeepSeek work space\dsh-team-plugin"
 node tools/verify.mjs          # 含最近 6 条事件
 ```
 
-或者直接读 `C:\Users\admin\.dsh\team\team.db`（SQLite，WAL 模式）。
+或者直接读 `%USERPROFILE%\.dsh\team\team.db`（SQLite，WAL 模式）。
 
 ### 回归：不能压坏原有功能
 
