@@ -172,6 +172,10 @@ dsh plugin --profile <profile> add "file:<克隆目录的绝对路径>"
 所以"合成树里有没有它"只能等应用重启后从插件页/工具列表确认
 ——重启后能看到 `mesh_` 前缀的工具即为安装成功。
 
+> **装完要回读 `fiberPhase`**：`enabled: true` 不代表插件起来了。安装副本缺文件时，
+> 插件页会是 `enabled: true` + `fiberPhase: null`（fiber 压根没建，工具自然也没有）。
+> 判定与处置见 [`docs/dev/0.4.0-跨端验证与安装排障-20261121.md`](docs/dev/0.4.0-跨端验证与安装排障-20261121.md)。
+
 卸载：
 
 ```powershell
