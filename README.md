@@ -154,38 +154,31 @@
 
 ## 安装
 
+把仓库克隆到本地任意目录，再以本地目录方式装进某个 profile：
+
 ```powershell
-dsh plugin --profile <profile> add "file:F:\DeepSeek work space\dsh-team-plugin"
+git clone https://github.com/alllllllllli/dsh-team-mesh.git
+dsh plugin --profile <profile> add "file:<克隆目录的绝对路径>"
 ```
 
 `dsh plugin` 只是把参数转给 pnpm；顺手会把 `dsh-team-mesh` 加到该 profile
 `package.json` 的 `dsh.profile.bundles` 里，插件因此进入合成树。
 
-### 当前状态：已装进 `desktop`（2026-11-07 18:55）
-
-```
-dsh plugin --profile desktop add "file:..."   → exit 0
-dsh.profile.bundles 末尾出现 dsh-team-mesh
-node_modules/dsh-team-mesh/ 落地，8 个关键文件与源哈希逐条一致
-```
-
-装之前备份了 `package.json.bak-20261107-185517-premesh` 与 `pnpm-lock.yaml.bak-...`。
+> Windows 上路径含空格时整段加引号，例如 `"file:C:\path with space\dsh-team-mesh"`。
 
 **生效需要重启 DSH**：`desktop` profile 由 Electron 应用独占管理，
 `dsh --profile desktop --dump-config` 会直接报
 `profile "desktop" is managed exclusively by the Electron application`，
-所以"合成树里有没有它"只能等应用重启后从插件页/工具列表确认。
-
-> pnpm 顺带把 `dsh-ops 0.4.4` 移除了（它本来就不在 bundles 里，属于之前遗留的孤立依赖）。
-> 如果发现哪个功能因此少了什么，用上面两个备份文件回滚。
+所以"合成树里有没有它"只能等应用重启后从插件页/工具列表确认
+——重启后能看到 `mesh_` 前缀的工具即为安装成功。
 
 卸载：
 
 ```powershell
-dsh plugin --profile desktop remove dsh-team-mesh
+dsh plugin --profile <profile> remove dsh-team-mesh
 ```
 
-板文件位置：`$DSH_HOME\team\team.db`（默认，即 `C:\Users\admin\.dsh\team\team.db`）。
+板文件位置：`$DSH_HOME\team\team.db`（Windows 默认在 `%USERPROFILE%\.dsh\team\team.db`）。
 要换位置，在 profile 里给插件加 `config: { boardPath: '...' }`。
 
 ## 验证过什么（2026-11-07 本机实测）
