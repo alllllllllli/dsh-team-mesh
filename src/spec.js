@@ -64,6 +64,10 @@ export function peersSpec() {
       '**链路状态**（interconnect peers() 的 up/down）、以及 down 时并列列出的**可能原因**',
       '（端口不通 / 隧道断了 / token 不一致 / instanceId 不匹配）。',
       '想深挖某一个对端时用 mesh_peer_probe，它会给出耗时、最后错误与可执行建议。',
+      '',
+      '0.6.1 起输出**首行给出板模式**：`远端` / `本地` / `本地降级（原因…）`。',
+      '看到「本地降级」说明远端共享板连不上、已自动退回本机板 —— 此时跨机任务不会同步，',
+      '网络恢复后重启 DSH 才会切回远端。',
     ].join('\n'),
     parameters: {
       includeSessions: {

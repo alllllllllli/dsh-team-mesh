@@ -167,9 +167,12 @@ test('远端板失败：诊断文件记下 boardEndpoint（但不含 token 等�
   process.env.DSH_HOME = dir; // 远端模式没有本地 boardPath，诊断文件按 $DSH_HOME/team 落
   try {
     const { ctx } = fakeCtx();
+    // 0.6.1 起远端连不上默认降级到本地板，不再写 load-error；
+    // 这条用例测的是**旧行为**（fail 模式），所以必须显式 boardFallback: 'fail'。
     const dispose = await apply(ctx, {
       boardEndpoint: 'http://127.0.0.1:1',
       boardToken: 'must-not-be-written',
+      boardFallback: 'fail',
     });
     assert.equal(typeof dispose, 'function');
     dispose();

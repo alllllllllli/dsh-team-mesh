@@ -9,6 +9,46 @@
 
 ---
 
+## 0.6.1（2026-11-21）
+
+**行为修复：远端板不可达时默认降级到单机板，不再让整个插件加载失败。**
+`schema_version` 仍为 **4**（无 schema 变更、无数据迁移）；不新增第三方依赖；
+远端能连上时行为与 0.6.0 完全一致，工具总数仍 **14**。
+
+### 修复：`boardEndpoint` 连不上 → 整插件不加载（2026-11-21 真事故）
+
+- 事故：重启后 `boardEndpoint` 指向的板服务因网络断不可达，`registerAll` 启动自检抛错 →
+  `apply()` 吞掉并返回空 disposer，**全部工具一个都没注册**，团队任务工具消失；
+  只在 `$DSH_HOME/team/mesh-load-error.json` 里留下一条错误证据。
+- 新增配置 `boardFallback: 'local' | 'fail'`，**默认 `'local'`**：
+  - `local`：远端健康检查失败（超时 / 拒绝 / 鉴权失败 / 非 JSON / endpoint 非法）时，
+    打一条 WARN（含 endpoint 与错误摘要，**不含 boardToken**）→ 改用本地板
+    （与单机模式完全相同的 Board 实现与库路径，建目录/建表沿用现有路径）→ **全部工具照常注册**；
+    写 `mesh-degraded.json`（`time` / `version` / `mode: 'local-degraded'` / `endpoint` /
+    `error.message` / `hint`），并删掉残留的 `mesh-load-error.json`。
+  - `fail`：维持 0.6.0 旧行为（装配期抛错 → 写 `mesh-load-error.json`；`DSH_TEAM_STRICT=1` 时抛给宿主）。
+  - 其他取值按 `local` 处理并 WARN（拼写错误不该把插件打挂）。
+- 降级后本地板初始化失败（库被锁 / 无权限 / 目录不可写）→ **如实按加载失败处理**
+  （写 `mesh-load-error.json`），不假装成功。
+- 后台恢复探测：默认每 30s（`boardRetryMs` 可覆盖）用 2s 短超时探 `GET /health`；
+  恢复只在日志/诊断里记**一次** `remote_available_again: true` 并提示重启切回，
+  **不热切换板后端**（本地/远端状态会打架）；定时器 `unref()` 且 dispose 时清掉。
+- 可诊断性：`mesh_peers` 输出**首行**给出 `板模式：远端 / 本地 / 本地降级（原因）`；
+  降级时 `mesh_dispatch` 提示「当前本地板，跨机任务不会同步；网络恢复后重启 DSH 切回远端」。
+  不新增工具（仍 14 个），不改 mesh 语义（租约 / 三证据 / 板模式判定均未动）。
+- 测试：新增 `test/board_fallback.test.mjs`（10 条：默认降级 / fail 旧行为 / strict 抛错 /
+  取值校验与拼错 / `mesh_peers` 板模式 / `mesh_dispatch` 降级提示 / 远端可用不降级并清旧证据 /
+  先失败后成功只记一次恢复 / dispose 后定时器不再跑 / 降级后本地板建任务列任务可用）。
+  `test/load_error.test.mjs` 的远端失败用例显式改为 `boardFallback: 'fail'`（它测的就是旧行为）。
+  全量 **299 / 299 通过**（0.6.0 基线 289 条一条没删；新增 10 条）。
+- 未验证（本版不替它背书，单列如下）：
+  1. **真实远端恢复路径未实测**：本机网络断（`172.24.112.14` 不可达），恢复探测只用
+     真 HTTP 假板服务（127.0.0.1）验证过；
+  2. **没有在真实 DSH 宿主里跑过 0.6.1**：本版只在仓库跑单测，没有重启任何 DSH；
+     已装副本仍是 0.6.0，要等用户重启才生效；
+  3. **降级期间跨机派活**只验证了"提示出现、投递行为不变"，没有验证对端在远端板上
+     查不到任务时的真实表现（这本来就是降级的已知限制，已写进 README）。
+
 ## 0.6.0（2026-11-21）
 
 本版收三项 P0 改进，全部来自调研报告（`C:\Users\ky614\mesh-research-report.md`）第 5 节：

@@ -35,6 +35,39 @@
     boardTimeoutMs: 10000
 ```
 
+## 远端板不可达时的降级行为（0.6.1）
+
+0.6.0 及以前：配了 `boardEndpoint` 但连不上（板服务没起 / 隧道断了 / token 不对 / 返回非 JSON），
+装配期直接抛错 → **整个插件不加载**，一个 `mesh_*` 工具都没有。
+
+> 真事故（2026-11-21）：重启后 `boardEndpoint: http://172.24.112.14:13090` 恰逢网络断，
+> `registerAll` 的健康检查抛错，团队任务工具全部消失；只在
+> `$DSH_HOME/team/mesh-load-error.json` 里留下一条证据，模型和用户都看不出"插件没加载"。
+
+0.6.1 起默认**自动降级到单机板**，插件照常加载：
+
+| 配置 | 远端连不上时的行为 |
+| --- | --- |
+| `boardFallback: 'local'`（**默认**，可省略） | 打一条 WARN 日志（含 endpoint 与错误摘要，**不含 token**）→ 改用本地板（`boardPath` 或 `$DSH_HOME/team/team.db`，与单机模式完全相同的实现）→ **全部工具照常注册** → 写 `mesh-degraded.json`，并删掉残留的 `mesh-load-error.json` |
+| `boardFallback: 'fail'` | 维持 0.6.0 的旧行为：加载失败、写 `mesh-load-error.json`（`DSH_TEAM_STRICT=1` 时把异常抛给宿主） |
+
+要点：
+
+- 降级是**启动时一次性**决定。后台每 30s 用 2s 短超时探一次远端 `GET /health`
+  （间隔可用 `boardRetryMs` 覆盖）；恢复只在日志/诊断里记一次 `remote_available_again: true`，
+  并提示**重启 DSH 才切回远端** —— 插件**不做热切换**（本地板上已有降级期间的数据，中途换后端两边状态会打架）。
+  后台定时器 `unref()` 且卸载时清掉，不会拖住进程。
+- 降级时 `mesh_peers` 输出**首行**给出 `板模式：本地降级（原因：…）` 与「跨机任务不会同步」提示；
+  `mesh_dispatch` 每次派发也会提示「当前本地板，跨机任务不会同步；网络恢复后重启 DSH 切回远端」。
+  **降级期间跨机派活不可靠**：任务写在本地板里，连远端板的对端查不到它。
+- 诊断文件与 load-error 同目录（远端/降级模式默认 `$DSH_HOME/team/mesh-degraded.json`），
+  字段：`time` / `version` / `mode: 'local-degraded'` / `endpoint` / `error.message` / `hint`；
+  探测到恢复后追加 `remote_available_again: true` 与 `remote_available_at`。**不含 boardToken**。
+- 降级后本地板也起不来（库被锁 / 没权限 / 目录不可写）→ **仍按加载失败处理**
+  （写 `mesh-load-error.json`，`DSH_TEAM_STRICT=1` 时抛错），不假装成功。
+- `boardFallback` 只认 `local` / `fail` 两个值；写错（如 `locall`）按 `local` 处理并打一条 WARN
+  —— 配置笔误不该把插件打挂，但也不能静默当对。
+
 ## 为什么可行（单机的关键前提）
 
 同一台机器上所有 DSH 实例共享 `DSH_HOME`。于是：
@@ -700,6 +733,10 @@ node tools/client_cli.mjs health  # 板服务运维客户端
 症状：DSH 能正常启动，但 `mesh_*` 工具一个都不见了 / 模型说没有这些工具；日志里可能只有一行 error。
 0.4 及以前这就是"静默空壳"（`apply()` 吞异常只写日志，然后返回空 no-op）。0.5 起失败会留下两样证据：
 
+> 0.6.1 起**远端板连不上默认不再走到这里**：插件会降级到本地板照常加载，证据落在同目录的
+> `mesh-degraded.json`（见「远端板不可达时的降级行为（0.6.1）」）。只有 `boardFallback: 'fail'`，
+> 或降级时本地板本身也起不来，才会出现 `mesh-load-error.json`。
+
 1. **诊断文件**：与板库同目录的 `mesh-load-error.json`
    （默认 `$DSH_HOME/team/mesh-load-error.json`；配了 `boardPath` 就跟着它走）。
    内容：`time` / `version` / `boardEndpoint` / `error.message` + `error.stack`（前 2000 字符）/ `hint`。
@@ -724,6 +761,9 @@ node tools/client_cli.mjs health  # 板服务运维客户端
   SQLite over SMB 的锁不可靠，WAL 尤其容易损坏。
 - 远端模式**只有一个板服务**（单点）。板服务停了，所有设备的写操作都会失败 —— 但它是
   **明确失败**（`BOARD_UNREACHABLE`），不是静默成功。没有做多副本 / 故障转移。
+- **降级不是切换**（0.6.1）：远端连不上时插件用本地板继续工作（`boardFallback: 'local'`，默认），
+  但**不会自动切回**；降级期间跨机任务不会同步，恢复后需重启 DSH。降级保的是"本机可用"，
+  不是"跨机一致"。
 - **自动重派默认是关的**（0.5 `autoRedispatch: false`）：打开后也只覆盖"本进程真的投递成功过、
   之后被标 stale"的任务；登记表在内存里，插件重启后就不知道"这条任务是本实例派的"了。
   远端板上客户端不能写审计，`task.redispatched` / `task.notify_*` 事件只在本地板可写时落盘

@@ -82,6 +82,34 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * 0.6.1：板模式的可诊断行。`mesh_peers` 的输出**首行**必须能看出当前用哪种板 ——
+ * 降级时更要能看出"因为什么降级的"，否则模型会把"本地板上查不到任务"误判成任务不存在。
+ *
+ * 只在 deps.getBoardMode 注入时才输出（build 出的 handlers 未接这个依赖时输出与 0.6.0 一致）。
+ *
+ * @param {{mode?:string, endpoint?:string, dbPath?:string|null, reason?:string}|null} modeInfo
+ * @returns {string[]}
+ */
+function renderBoardModeLines(modeInfo) {
+  if (modeInfo === null || typeof modeInfo !== 'object') return [];
+  if (modeInfo.mode === 'remote') return [`板模式：远端（${modeInfo.endpoint ?? '?'}）`];
+  if (modeInfo.mode === 'local-degraded') {
+    return [
+      `板模式：本地降级（原因：${modeInfo.reason ?? '远端板不可达'}）`,
+      '提示：当前本地板，跨机任务不会同步；网络恢复后重启 DSH 切回远端。',
+    ];
+  }
+  if (modeInfo.mode === 'local') return [`板模式：本地（${modeInfo.dbPath ?? '本机 SQLite'}）`];
+  return [];
+}
+
+/** 降级时的派发告警：跨机派活在本地板上**不会同步**，必须说清楚，不能让人以为派成功了。 */
+function boardModeWarning(modeInfo) {
+  if (modeInfo === null || typeof modeInfo !== 'object' || modeInfo.mode !== 'local-degraded') return null;
+  return '⚠ 板模式：本地降级 —— 当前本地板，跨机任务不会同步；网络恢复后重启 DSH 切回远端。';
+}
+
 async function readRequest(board, requestId) {
   try {
     return await board.getSessionRequest(requestId);
@@ -314,6 +342,19 @@ export function createHandlers(deps) {
   const { getBoard, getInterconnect } = deps;
 
   /**
+   * 0.6.1：当前板模式（可选依赖）。不传 → null，诊断输出与 0.6.0 一字不差。
+   * 只用来"如实描述现状"，不参与任何判定 —— 板能不能用由 board 自己回答。
+   */
+  const boardMode = () => {
+    if (typeof deps.getBoardMode !== 'function') return null;
+    try {
+      return deps.getBoardMode() ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  /**
    * 0.5：本实例派发登记表（可选依赖）。测试不传 → null，派发行为与 0.4 一字不差。
    */
   const dispatchRegistry = deps.dispatchRegistry ?? null;
@@ -363,9 +404,12 @@ export function createHandlers(deps) {
 
   return {
     async mesh_peers(args, exec) {
+      // 0.6.1：板模式放最前面 —— 降级时"板不对"比"peer 不通"更根本
+      const modeLines = renderBoardModeLines(boardMode());
       const interconnect = getInterconnect();
       if (interconnect === null || typeof interconnect !== 'object') {
         return [
+          ...modeLines,
           '本实例上没有 interconnect 服务，跨实例派活不可用。',
           '（dsh-interconnect 插件未启用，或它的服务尚未激活。）',
           '共享任务板仍然可用：同一台机器上的其他 DSH 实例可以自己来认领任务。',
@@ -376,10 +420,11 @@ export function createHandlers(deps) {
       try {
         rows = interconnect.peers();
       } catch (err) {
-        return `读 peer 列表失败：${err?.message ?? String(err)}`;
+        return [...modeLines, `读 peer 列表失败：${err?.message ?? String(err)}`].join('\n');
       }
       if (!Array.isArray(rows) || rows.length === 0) {
         return [
+          ...modeLines,
           '本实例没有配置任何对端 DSH 实例（peers）。',
           '要跨实例派活，得先在 dsh-interconnect 的配置里加上对端的 instanceId 与 origin。',
         ].join('\n');
@@ -389,7 +434,11 @@ export function createHandlers(deps) {
       // 探测失败一律不抛：这是诊断信息，不能因此让整个工具失败。
       const probed = await Promise.all(rows.map((p) => probePeer(p)));
 
-      const lines = [`本实例：${instanceIdOf(interconnect, sessionIdOf(exec))}`, `对端 ${rows.length} 个：`];
+      const lines = [
+        ...modeLines,
+        `本实例：${instanceIdOf(interconnect, sessionIdOf(exec))}`,
+        `对端 ${rows.length} 个：`,
+      ];
       for (let i = 0; i < rows.length; i += 1) {
         const p = rows[i];
         const got = probed[i];
@@ -749,6 +798,8 @@ export function createHandlers(deps) {
     async mesh_dispatch(args, exec) {
       const taskId = requireTaskId(args);
       const instanceId = assertNonEmptyString(args?.instanceId, 'instanceId', 256);
+      // 0.6.1：降级板上跨机派活不可靠（任务只在本机库里，对端查不到）—— 每次派发都如实提示
+      const modeWarning = boardModeWarning(boardMode());
       // v3：newSession=true 时不要求 sessionId（那个会话还没被建出来）
       const wantsNewSession = args?.newSession === true;
       const givenSessionId = args?.sessionId === undefined || args?.sessionId === null
@@ -858,7 +909,7 @@ export function createHandlers(deps) {
         if (created.ok !== true) {
           // 关键：**不降级**。建不出来就如实报，绝不偷偷改投给某个现成会话 ——
           // 那正是这次要消灭的行为。
-          return created.text;
+          return modeWarning === null ? created.text : `${modeWarning}\n\n${created.text}`;
         }
         sessionId = created.sessionId;
         createdNote = created.note;
@@ -913,6 +964,7 @@ export function createHandlers(deps) {
       if (result.delivered === true) {
         return [
           `**${view.label}** → ${instanceId} / ${sessionId}`,
+          modeWarning === null ? '' : modeWarning,
           createdNote === null ? '' : `  ${createdNote}`,
           `  任务：${task.task_id} ${task.title}`,
           result.delivery === undefined ? '' : `  投递方式：${result.delivery}`,
@@ -931,6 +983,7 @@ export function createHandlers(deps) {
       }
       return [
         `**未投递（信没送到）**：${instanceId} / ${sessionId}`,
+        modeWarning === null ? '' : modeWarning,
         createdNote === null ? '' : `  ${createdNote}`,
         `  原因：${result.reason}`,
         '',
