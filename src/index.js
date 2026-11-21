@@ -7,6 +7,11 @@
  *    不该是"应用打不开"。所以这里整段 try/catch，失败时记日志并返回空 disposer；
  *    排查期把 `DSH_TEAM_DEBUG=1` 打开可以把错误抛出来（否则"插件静默不工作"极难查）。
  *
+ *    0.5 起：**失败必须可发现**。吞异常的同时会在板库同目录写一份 `mesh-load-error.json`
+ *    （含时间 / 版本 / 板地址 / 错误 message+stack 前 2000 字符 / 排查提示），日志里带上它的路径；
+ *    装载成功会删掉上次遗留的这份文件。`DSH_TEAM_STRICT=1` 时改为**把异常抛出去**，
+ *    让 DSH 启动失败 —— 运维至少看得见（默认仍是"插件坏了不拖垮宿主"）。
+ *
  * 2. **disposers 必须最先声明。** 迟声明会撞上 const 的暂时性死区，抛 ReferenceError，
  *    又被自己的 catch 吞掉 —— 工具注册成功了、解绑函数却从来没登记，卸载时不会释放。
  *
@@ -15,11 +20,13 @@
  */
 
 import fs from 'node:fs';
+import path from 'node:path';
 
 import { serviceSessionRequests } from './createSession.js';
 import { DEFAULT_DISPATCHER_POLL_MS, normalizeDispatcherSessions, startDispatcher } from './dispatcher.js';
 import { createHandlers } from './handlers.js';
 import { installInboxHook } from './inboxHook.js';
+import { createDispatchRegistry, DEFAULT_REDISPATCH_POLL_MS, startLifecycle } from './lifecycle.js';
 import { RemoteBoard } from './remote.js';
 import { allSpecs, TOOL_NAMES } from './spec.js';
 import { defaultBoardPath, openBoard } from './store.js';
@@ -41,7 +48,7 @@ export const name = 'dsh-team-mesh';
  */
 export const inject = ['tools', 'interconnect'];
 
-export const PLUGIN_VERSION = '0.4.0';
+export const PLUGIN_VERSION = '0.5.0';
 
 async function loadDefineTool() {
   try {
@@ -104,17 +111,98 @@ function interconnectOf(ctx) {
   }
 }
 
+/** 加载失败诊断文件名（写在板库同目录，`$DSH_HOME/team/` 是它的默认落点）。 */
+export const LOAD_ERROR_FILENAME = 'mesh-load-error.json';
+
+/** 诊断文件里 stack 只留前 2000 字符：够定位，又不至于把文件撑成日志。 */
+const LOAD_ERROR_STACK_LIMIT = 2000;
+
+/**
+ * 诊断文件路径。**与板库同目录**：
+ *   - 单机模式且配了 `boardPath` → 那个库所在目录；
+ *   - 其余（远端板 / 没配）→ 与 `defaultBoardPath()` 同源的 `$DSH_HOME/team/`。
+ * 绝不硬编码某个用户的绝对路径：板库换位置时诊断文件跟着走，运维只需要知道一处。
+ */
+export function resolveLoadErrorPath(config = {}) {
+  const endpoint = typeof config?.boardEndpoint === 'string' ? config.boardEndpoint.trim() : '';
+  const configured = typeof config?.boardPath === 'string' ? config.boardPath.trim() : '';
+  const boardPath = endpoint === '' && configured.length > 0 ? configured : defaultBoardPath();
+  return path.join(path.dirname(boardPath), LOAD_ERROR_FILENAME);
+}
+
+/**
+ * 把加载失败落成可发现的文件。写文件本身失败只 warn —— **诊断失败绝不能盖住原始错误**。
+ *
+ * @returns {string|null} 真的写上了才返回路径
+ */
+function writeLoadError(config, err, ctx) {
+  const file = resolveLoadErrorPath(config);
+  const endpoint = typeof config?.boardEndpoint === 'string' && config.boardEndpoint.trim().length > 0
+    ? config.boardEndpoint.trim()
+    : null;
+  const body = {
+    time: new Date().toISOString(),
+    version: PLUGIN_VERSION,
+    boardEndpoint: endpoint,
+    error: {
+      message: String(err?.message ?? err),
+      stack: String(err?.stack ?? '').slice(0, LOAD_ERROR_STACK_LIMIT),
+    },
+    hint: '设 DSH_TEAM_DEBUG=1 可让启动失败以暴露错误',
+  };
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
+    return file;
+  } catch (writeErr) {
+    try {
+      ctx?.logger?.warn?.(`[dsh-team-mesh] 加载失败诊断文件写不上（${file}）：${writeErr?.message ?? writeErr}`);
+    } catch {
+      /* ignore */
+    }
+    return null;
+  }
+}
+
+/** 装载成功：删掉上次遗留的诊断文件。删不掉不影响装载（它只是证据，不是状态）。 */
+function clearLoadError(config, ctx) {
+  const file = resolveLoadErrorPath(config);
+  try {
+    fs.rmSync(file, { force: true });
+  } catch (err) {
+    try {
+      ctx?.logger?.warn?.(`[dsh-team-mesh] 旧诊断文件删不掉（${file}）：${err?.message ?? err}`);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/** 开关值解析与板服务同一口径：1/true/yes/on 才算开（trim + 小写）。 */
+const ENV_FLAG_TRUTHY = new Set(['1', 'true', 'yes', 'on']);
+function envFlagEnabled(name) {
+  const raw = process.env[name];
+  return typeof raw === 'string' && ENV_FLAG_TRUTHY.has(raw.trim().toLowerCase());
+}
+
 export async function apply(ctx, config = {}) {
   const disposers = [];
   try {
-    return await registerAll(ctx, config, disposers);
+    const dispose = await registerAll(ctx, config, disposers);
+    // 装载成功 = 上次那份失败诊断已过时，必须删掉，否则排障会被旧证据误导
+    clearLoadError(config, ctx);
+    return dispose;
   } catch (err) {
+    const diagnosticPath = writeLoadError(config, err, ctx);
     try {
-      ctx?.logger?.error?.(`[dsh-team-mesh] 加载失败：${err?.stack ?? err}`);
+      ctx?.logger?.error?.(
+        `[dsh-team-mesh] 加载失败：${err?.stack ?? err}` +
+          `（诊断文件：${diagnosticPath ?? '写不上'}；设 DSH_TEAM_STRICT=1 可让启动失败以暴露错误）`,
+      );
     } catch {
       /* 连日志都写不了就算了 */
     }
-    if (process.env.DSH_TEAM_DEBUG) throw err;
+    if (process.env.DSH_TEAM_DEBUG || envFlagEnabled('DSH_TEAM_STRICT')) throw err;
     return () => {};
   }
 }
@@ -163,6 +251,10 @@ async function registerAll(ctx, config, disposers) {
   // 空数组 = 这个角色不存在，行为与旧版一致。
   const dispatcherSessions = normalizeDispatcherSessions(config.dispatcherSessions);
 
+  // 0.5：本进程"经手过哪些派发"的登记表。只有 mesh_dispatch 真的投递成功才登记；
+  // stale 自动重派与完成通知都从它取候选（详见 lifecycle.js 顶部的已知边界）。
+  const dispatchRegistry = createDispatchRegistry();
+
   const handlers = createHandlers({
     getBoard: () => board,
     getInterconnect: () => interconnectOf(ctx),
@@ -173,6 +265,8 @@ async function registerAll(ctx, config, disposers) {
     newSessionAckFloorMs: config.newSessionAckFloorMs,
     // 0.4：单机板上是否允许"未验证收养"（默认 false = 严格；远端板由板服务自己配置决定）
     allowUnverifiedAdoption: config.allowUnverifiedAdoption === true,
+    // 0.5：派发成功后登记，给 stale 自动重派 / 完成通知用
+    dispatchRegistry,
   });
 
   const defineTool = await loadDefineTool();
@@ -238,6 +332,37 @@ async function registerAll(ctx, config, disposers) {
   disposers.push(() => {
     if (createTimer !== null) clearInterval(createTimer);
   });
+
+  // ── 0.5：派发后的生命周期（stale 自动重派 / 完成通知派发方）──
+  // 两件事共用一份登记表与一个定时器：
+  //   - autoRedispatch **默认 false**，关着时行为与 0.4 完全一致（不读、不写、不发）；
+  //   - notifyOnComplete 默认 true，但只有"本进程真的投递成功过"的任务才会被轮询到，
+  //     没派过活就等于零成本。失败只记 warn，不影响整棵插件树 —— 与建会话/总管同一口径。
+  const lifecycleWanted = config.autoRedispatch === true || config.notifyOnComplete !== false;
+  if (lifecycleWanted) {
+    try {
+      const lifecycle = startLifecycle({
+        board,
+        registry: dispatchRegistry,
+        getInterconnect: () => interconnectOf(ctx),
+        instanceId: selfInstance,
+        config: {
+          autoRedispatch: config.autoRedispatch === true,
+          maxRedispatch: config.maxRedispatch,
+          notifyOnComplete: config.notifyOnComplete !== false,
+        },
+        pollMs: Number(config.redispatchPollMs ?? DEFAULT_REDISPATCH_POLL_MS),
+        logger: ctx?.logger,
+      });
+      disposers.push(() => lifecycle.dispose());
+    } catch (err) {
+      try {
+        ctx?.logger?.warn?.(`[dsh-team-mesh] 派发后生命周期未启用：${err?.message ?? err}`);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
 
   // ── 总管分流：轮询共享板，看到"派给本实例某个总管会话"的派发就建子会话并代签回执 ──
   // 与建会话服务共用一套"定时器 + 板"的取数方式；失败只记 warn，不拖垮整棵插件树。

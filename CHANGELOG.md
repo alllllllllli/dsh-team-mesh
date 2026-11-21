@@ -9,6 +9,67 @@
 
 ---
 
+## 0.5.0（2026-11-21）
+
+本版收三件事：**修掉 0.4 遗留的"加载失败静默空壳"缺陷**、**stale 任务自动重派（默认关）**、
+**任务完成主动通知派发方（默认开）**。`schema_version` 仍为 **4**，**无 schema 变更、无数据迁移**；
+不新增第三方依赖；两项新功能的默认值按"不改变现有行为"来定（重派关、通知只在派过活的实例上生效）。
+
+### 修复：`apply()` 吞异常导致插件静默空壳（2026-11-14 已定性为真缺陷）
+
+- 装载失败时在**板库同目录**写 `mesh-load-error.json`（`time` / `version` / `boardEndpoint` /
+  `error.message` + `error.stack` 前 2000 字符 / `hint`），日志 error 级并**带文件路径**；
+  装载成功时删除上一份遗留的诊断文件。
+- 新增 `DSH_TEAM_STRICT=1`：加载失败**抛错**让 DSH 启动失败（运维能看见）；默认仍吞错，
+  保持"插件坏了不拖垮宿主"的初衷。`DSH_TEAM_DEBUG=1` 行为不变（也抛错）。
+- README 新增「插件没加载上怎么查（0.5）」，写清诊断文件字段、排查顺序与 strict 开关的代价。
+- 测试（`test/load_error.test.mjs`，5 条）：失败写诊断文件 / 成功删旧文件 / strict 抛错 /
+  默认不抛且返回可调用 disposer / 路径与 defaultBoardPath 同源且**不含 boardToken**。
+
+### 新增：stale 任务自动重派（`autoRedispatch`，默认 `false`）
+
+- 配置：`autoRedispatch: false`、`maxRedispatch: 1`、`redispatchPollMs: 15000`（与完成通知共用定时器）。
+- **四条同时满足才重派**：任务未终结 + 已 stale + 重派次数 < `maxRedispatch` + 该次派发是本实例发出的
+  （进程内登记表，只有 `mesh_dispatch` **真的投递成功**才登记）。
+- 重派 = 同一张任务卡再投回**原** `instanceId` / `sessionId`，并 `recordDispatch` 开一个新的 ack 窗口
+  —— 不偷偷改投别的会话，也不新增数据库字段（次数按板上 `task.redispatched` 事件计）。
+- 审计：成功 `task.redispatched`（`reason` / `attempt` / `original_instance` / `original_session` /
+  `delivered` / `ack_state`）；失败 `task.redispatch_failed`（含 `reason`），**不把失败写成成功**。
+- 关闭（默认）时行为与 0.4 一字不差：不读、不写、不发。
+
+### 新增：任务完成主动通知派发方（`notifyOnComplete`，默认 `true`）
+
+- 本实例派出去的任务在板上变成 `done` **或** `canceled` 时，经 `ctx.interconnect.send` 给
+  **原派发方会话**发一条 ≤200 字短消息（任务号 / 标题 / 最终状态 / 耗时 / 证据数量，不发整段 payload）。
+- **同一任务只通知一次**：按板上 `task.notify_sent` / `task.notify_failed` / `task.notify_skipped`
+  事件去重（无新增字段），进程内另有兜底，避免远端板写不了审计时每轮重复通知。
+- 没有 interconnect 时不报错，落 `task.notify_skipped`（`reason=no-interconnect`），降级为
+  "板上事件 + 收件箱注入"；送到落 `task.notify_sent`，没送到落 `task.notify_failed`（含 `reason`）。
+
+### 版本与验证
+
+- 版本 `0.4.0` → `0.5.0`，三处同步：`package.json` `version`、`dsh.plugin.json` `version`、
+  `src/index.js` `PLUGIN_VERSION`。
+- 全量单测：**263 / 263 通过、0 失败**（新增 19 条：`test/load_error.test.mjs` 5 条、
+  `test/lifecycle.test.mjs` 14 条；原 244 条一条没红）。
+- **变异验证（证明新测试不是摆设，均先备份后还原）**：删掉"装载成功删旧诊断文件" → 1 条红；
+  重派条件去掉 stale 判断 → 1 条红；通知去重条件取反 → 5 条红。
+- 未验证（本版不替它背书，单列如下）：
+  1. **没有在真实 DSH 宿主里跑过 0.5**：本版只在本仓跑单测，没有重启任何 DSH；在用的三台
+     （pc-ky614 / server / mcloud）插件侧仍是 0.4 运行中。
+  2. **通知"回到本实例自己的会话"这条路未实测**：按 `dsh-interconnect` 公开类型，`send` 需要
+     `peers` 里有以自己 `instanceId` 为键的 `self` 路由；本机 profile 没配 self，所以真实环境里
+     预期是 `delivered:false` → `task.notify_failed`（如实降级，不是成功路径）。测试里用的是假
+     interconnect，只证明了"delivered/reason 被如实记录"。
+  3. **远端板模式下新审计事件未实测**：远端板禁止客户端写审计（`REMOTE_AUDIT_READONLY`），
+     `task.redispatched` / `task.notify_*` 只在本地板可写时落盘；远端模式的重派次数靠进程内计数兜底。
+     这条没有对真实板服务跑过。
+  4. **跨机 true HTTP 场景只跑了本仓脚本**：`node tools/e2e_remote.mjs` **24/24 通过**、
+     `node tools/e2e_v2.mjs` **29/29 通过**（脚本自起板服务、随机端口，是"真 HTTP 但同一台机器"，
+     不等于两台真实主机）。本版不做跨机双机声明。
+  5. 插件重启前派出的任务不会被自动重派 / 主动通知 —— 登记表在内存里，这是"不新增字段不做迁移"
+     的既定代价，已写进 README 已知限制。
+
 ## 0.4.0（2026-11-14）
 
 本版把三块并行开发的功能收进同一个发布候选：**总管（dispatcher）角色**、**板服务硬化**、

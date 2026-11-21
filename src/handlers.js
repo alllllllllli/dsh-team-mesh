@@ -289,6 +289,11 @@ export function createHandlers(deps) {
   const { getBoard, getInterconnect } = deps;
 
   /**
+   * 0.5：本实例派发登记表（可选依赖）。测试不传 → null，派发行为与 0.4 一字不差。
+   */
+  const dispatchRegistry = deps.dispatchRegistry ?? null;
+
+  /**
    * 本实例配置的总管会话（可能为空）。
    * 测试直接构造 handlers 时不传这个依赖 → 空数组，旧的认领行为一字不差。
    */
@@ -740,6 +745,23 @@ export function createHandlers(deps) {
         createdSession: createdNote !== null,
       });
       const view = describeDelivery(result.delivered === true, ackInfo.ack_state, result.reason);
+
+      // 0.5：登记"本实例派出过这条任务"，给 stale 自动重派 / 完成主动通知用。
+      // 只在**真的送到**时登记：没送到的派发不存在"派发方在等它做完"这件事。
+      // 登记失败只影响这两项新功能，绝不改变本次派发的结论。
+      if (result.delivered === true && dispatchRegistry !== null) {
+        try {
+          dispatchRegistry.record?.(taskId, {
+            peerInstance: instanceId,
+            peerSession: sessionId,
+            dispatcherInstance: instanceIdOf(interconnect, sessionIdOf(exec)),
+            dispatcherSession: sessionIdOf(exec),
+            dispatchedAt: Date.now(),
+          });
+        } catch {
+          /* ignore */
+        }
+      }
 
       if (result.delivered === true) {
         return [

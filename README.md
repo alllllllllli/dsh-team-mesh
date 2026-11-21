@@ -79,7 +79,7 @@
 | **送到了没人管** | 投递成功但 `ackTimeoutMs`（默认 60s）内无 `mesh_task_ack` | 扫出 `ack_state=timeout` + `task.ack_timeout` 事件 |
 | **有人接了但在干** | 收到 `mesh_task_ack` 并 `mesh_task_claim` | `ack_state=acked`，租约有效 |
 | **人挂了/跑偏** | 租约到期无 `mesh_task_heartbeat` | 标 `stale` + `lease.stale` 事件，**可被接管** |
-| **真的做完了** | 有可采信证据 + 门禁通过 | `lifecycle=done`，**下一轮自动注入**给发起方 |
+| **真的做完了** | 有可采信证据 + 门禁通过 | `lifecycle=done`，**下一轮自动注入**给发起方；0.5 起 `notifyOnComplete` 还会主动推一条短消息（见下文） |
 
 **这五种状态在 `mesh_task_list` 里用不同标记显示，不会被抹平成"正常"。**
 
@@ -133,6 +133,65 @@
 所以"没动静"和"有噪声被滤掉"不会混为一谈。
 
 
+
+## 派发之后（0.5）：stale 自动重派 / 完成通知
+
+0.4 的"派发方跟踪止于 ack"到 0.5 补了两件**派发方一侧**的事，默认值按"不改变现有行为"来定：
+
+| 功能 | 开关 | 默认 | 作用 |
+| --- | --- | --- | --- |
+| stale 自动重派 | `autoRedispatch` | **`false`（关）** | 本实例派出去、租约过期被标 `stale` 的任务，自动**再投一次**到原 `instanceId` / `sessionId` |
+| 完成主动通知 | `notifyOnComplete` | **`true`（开）** | 本实例派出去的任务变成 `done` / `canceled` 时，给**原派发方会话**推一条 ≤200 字短消息 |
+
+两件事共用一份**进程内登记表**（只有 `mesh_dispatch` **真的投递成功**才登记）和一个轮询定时器
+（`redispatchPollMs`，默认 15s）。没派过活的插件实例上它等于零成本：登记表为空，一轮扫描直接返回。
+
+```yaml
+- id: dsh-team-mesh
+  config:
+    autoRedispatch: false     # 默认关；打开后 stale 任务会被自动补投
+    maxRedispatch: 1          # 最多补投几次（按板上 task.redispatched 事件计）
+    redispatchPollMs: 15000   # 上述两件事共用的轮询间隔
+    notifyOnComplete: true    # 默认开；关掉就退回 0.4 的"只能自己刷板"
+```
+
+### stale 自动重派（`autoRedispatch`）
+
+**四条同时满足才重派**（缺一条都不动）：
+
+1. 任务**未终结**（`done` / `canceled` 不碰）；
+2. 任务**已 stale**（租约过期被扫描标记，`task.stale=1`）；
+3. 该任务的**重派次数 < `maxRedispatch`**（次数 = 板上 `task.redispatched` 事件条数，**不新增数据库字段**）；
+4. 这次派发是**本实例发出的**（进程内登记表里有它，说明本进程真的投递成功过）。
+
+重派 = 把同一张任务卡**再投给原 target**（`instanceId` + `sessionId`，不偷偷改投别的会话），
+并 `recordDispatch` 开一个新的 **ack 窗口** —— 与一次普通派发完全同义。
+
+- 成功落 `task.redispatched`：`reason`（`lease-stale`）、`attempt`、`original_instance`、
+  `original_session`、`delivered`、`ack_state`；
+- 失败落 `task.redispatch_failed`：含 `reason`（`session-not-live` / `unreachable` /
+  `no-interconnect` …），**不写成功事件、不假装重派过**；同一条任务在本进程内失败一次后不再重试
+  （避免每轮写一条失败事件），人工可 `mesh_task_adopt` / `claim` 接手；
+- 关着（默认）时行为与 0.4 完全一致：不读、不写、不发。
+
+### 完成通知（`notifyOnComplete`）
+
+本实例派出去的任务在板上变成 `done` **或** `canceled` 时，给**原派发方会话**发一条短消息
+（任务号 / 标题 / 最终状态 / 耗时 / 证据数量，≤200 字，不发整段 payload）：
+
+```text
+[mesh] t-1a2b3c4d 写报告 已完成
+耗时 2m5s｜证据 1 条｜目标 server
+```
+
+- 走宿主 `ctx.interconnect.send`；**同一任务只通知一次**（去重看板上 `task.notify_sent` /
+  `task.notify_failed` / `task.notify_skipped` 事件，不新增字段）。
+- 没有 interconnect 时不报错，落 `task.notify_skipped`（`reason=no-interconnect`），
+  降级为"板上事件 + 收件箱注入"——发起方下一轮仍能看到结论。
+- 送到了落 `task.notify_sent`；没送到落 `task.notify_failed`（含 `reason`），**不写成成功**。
+- **已知边界**：通知目标是"原派发方会话"，而派发方通常就在本实例上。`interconnect.send` 要寻址
+  本实例自己的会话，需要 interconnect 的 `peers` 里有以自己 `instanceId` 为键的 `self` 路由；
+  没配时 `send` 返回 `delivered:false`，本插件如实落 `task.notify_failed`（不会静默成功）。
 
 ## 四条不变量（这是这个插件真正的价值）
 
@@ -566,10 +625,34 @@ node tools/client_cli.mjs health  # 板服务运维客户端
 ```
 
 - `tools/asar.mjs` — 零依赖 asar 读取器（`list` / `extract`）。头部布局踩过坑，注释里写了实测值。
-- `DSH_TEAM_DEBUG=1` — 让 `apply()` 把加载错误抛出来（默认吞掉并记日志，因为插件坏了不该让应用起不来）。
+- `DSH_TEAM_DEBUG=1` — 让 `apply()` 把加载错误抛出来（默认吞掉并记日志 + 写诊断文件，因为插件坏了不该让应用起不来）。
+- `DSH_TEAM_STRICT=1` — 同上但用于生产排障（0.5）：加载失败直接抛错让 DSH 启动失败，代价是应用起不来。
 - `DSH_TOOLS_PATH` — 本地开发时指向 `dsh-tools/lib/index.js`，让 `apply()` 能解析到它。
 - `DSH_TEAM_BOARD_TOKEN` / `DSH_TEAM_BOARD_PORT` / `DSH_TEAM_BOARD_DB` — 板服务的配置。
 - `DSH_TEAM_BOARD_ENDPOINT` / `DSH_TEAM_BOARD_TOKEN` — 客户端配置（CLI 用）。
+
+## 插件没加载上怎么查（0.5）
+
+症状：DSH 能正常启动，但 `mesh_*` 工具一个都不见了 / 模型说没有这些工具；日志里可能只有一行 error。
+0.4 及以前这就是"静默空壳"（`apply()` 吞异常只写日志，然后返回空 no-op）。0.5 起失败会留下两样证据：
+
+1. **诊断文件**：与板库同目录的 `mesh-load-error.json`
+   （默认 `$DSH_HOME/team/mesh-load-error.json`；配了 `boardPath` 就跟着它走）。
+   内容：`time` / `version` / `boardEndpoint` / `error.message` + `error.stack`（前 2000 字符）/ `hint`。
+2. **日志**：error 级，**带诊断文件路径**。
+
+装载成功时会**自动删掉**上一份遗留的诊断文件 —— 看到它存在，就说明最近一次加载确实失败了。
+
+排查顺序：
+
+1. 读 `mesh-load-error.json`，先看 `error.message`（最常见：连不上远端板 / 板服务没起 / `boardToken` 不对）；
+2. 远端模式先 `curl http://<板地址>/health`，确认板服务活着、`schema_version` 对得上、密钥能用（拿写操作验，别只看 GET）；
+3. 要**让 DSH 启动失败以暴露问题**（而不是继续静默）：设 `DSH_TEAM_STRICT=1`
+   （老开关 `DSH_TEAM_DEBUG=1` 也会抛错）；确认问题后记得撤掉，否则插件一坏 DSH 就起不来；
+4. 单机模式排障：清掉 `boardEndpoint` 回到本机板。
+
+> 默认仍是"插件坏了不拖垮宿主"：`apply()` 吞掉异常并返回空 disposer。区别只是**现在失败可发现**——
+> 有文件、有路径、有 stack，而不是只有一行没人看的日志。
 
 ## 已知限制
 
@@ -577,12 +660,15 @@ node tools/client_cli.mjs health  # 板服务运维客户端
   SQLite over SMB 的锁不可靠，WAL 尤其容易损坏。
 - 远端模式**只有一个板服务**（单点）。板服务停了，所有设备的写操作都会失败 —— 但它是
   **明确失败**（`BOARD_UNREACHABLE`），不是静默成功。没有做多副本 / 故障转移。
-- 租约过期只会标 `stale` 并留痕，**没有自动重派**：重新认领（`claim`）或收养（`adopt`）仍要人 / 模型
-  发起，不存在"调度器自动把死掉的任务再派出去"。
+- **自动重派默认是关的**（0.5 `autoRedispatch: false`）：打开后也只覆盖"本进程真的投递成功过、
+  之后被标 stale"的任务；登记表在内存里，插件重启后就不知道"这条任务是本实例派的"了。
+  远端板上客户端不能写审计，`task.redispatched` / `task.notify_*` 事件只在本地板可写时落盘
+  （远端模式下降级为本机日志，重派次数用进程内计数兜底）。
 - 没有成员/角色概念：只有会话（session）与任务。原型阶段刻意不引入（总管 dispatcher 是**会话级配置**，
   不是角色系统）。
-- `mesh_dispatch` 的跟踪止于**回执**（`ack`）：对方接了之后是否真的在干、干到哪一步，只能看共享板上的
-  租约 / 证据 / 事件；派发方不会收到主动推送。
+- `mesh_dispatch` 的跟踪止于**回执 + 完成事件**：对方接了之后是否真的在干、干到哪一步，只能看共享板上的
+  租约 / 证据 / 事件；0.5 起 `notifyOnComplete` 默认会在任务 `done` / `canceled` 时推一条短消息，
+  但它**不跟踪中间过程**，且通知本身依赖 interconnect 能寻址到派发方自己的会话（见下文「派发之后（0.5）」）。
 - 板服务硬化后仍有边界：审计 append **不 fsync**（崩溃/断电可能丢最后几行）；限流是固定窗口
   （边界允许约 2 倍突发），按 `socket` IP + token 指纹分桶 —— 前面若加了反向代理，所有调用方会共用
   代理 IP（此时 token 指纹仍能区分密钥）。
@@ -674,6 +760,17 @@ $env:DSH_TEAM_BOARD_HOST = "127.0.0.1"
 | `dispatcherPollMs` | `3000`（夹取 250–60000） | 总管轮询间隔 |
 | `newSessionAckFloorMs` | `180000`（180s） | `newSession` 回执窗口下限；只抬回执窗口，不抬建会话等待 |
 | `allowUnverifiedAdoption` | `false`（严格） | **仅单机板**；远端板由板服务策略决定 |
+
+**插件 config（0.5 新增）**
+
+| 开关 | 默认 | 说明 |
+| --- | --- | --- |
+| `autoRedispatch` | `false` | 本实例派出去的任务被标 stale 后自动补投一次；关着时与 0.4 行为完全一致 |
+| `maxRedispatch` | `1` | 最多补投几次（夹取 0–10；按板上 `task.redispatched` 事件计数，无 schema 变更） |
+| `redispatchPollMs` | `15000`（夹取 1000–300000） | 重派 / 完成通知共用的轮询间隔 |
+| `notifyOnComplete` | `true` | 任务 `done` / `canceled` 时主动通知原派发方会话（≤200 字；无 interconnect 时降级落事件） |
+
+环境变量（0.5 新增）：`DSH_TEAM_STRICT=1` —— 插件加载失败时**抛出**异常让 DSH 启动失败（默认吞错并在板库同目录写 `mesh-load-error.json`，见下文「插件没加载上怎么查」）。
 
 **板服务 env（`node src/server.js` / 计划任务 `dsh-team-board`）**
 

@@ -95,8 +95,10 @@ export function dispatcherCursorKey(sessionId) {
 /**
  * 事件 payload 可能是对象（本地板 recentEvents 已解析）也可能是 JSON 字符串
  * （pendingEvents 原样返回，远端板上还是字符串）。两种都要能读。
+ *
+ * 0.5 起也供 lifecycle.js 复用（同一份读法，避免两处各写一份会漂移的解析）。
  */
-function payloadOf(event) {
+export function payloadOf(event) {
   const raw = event?.payload;
   if (raw === null || raw === undefined) return {};
   if (typeof raw !== 'string') return raw;
@@ -114,7 +116,7 @@ function payloadOf(event) {
  *
  * @returns {Promise<boolean>} 真的写上了才 true
  */
-async function appendAudit(board, kind, taskId, actor, payload) {
+export async function appendAudit(board, kind, taskId, actor, payload) {
   if (typeof board?.appendEvent !== 'function') return false;
   try {
     await board.appendEvent(kind, taskId, actor, payload);
