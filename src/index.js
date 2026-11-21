@@ -48,7 +48,7 @@ export const name = 'dsh-team-mesh';
  */
 export const inject = ['tools', 'interconnect'];
 
-export const PLUGIN_VERSION = '0.5.0';
+export const PLUGIN_VERSION = '0.6.0';
 
 async function loadDefineTool() {
   try {
@@ -267,6 +267,14 @@ async function registerAll(ctx, config, disposers) {
     allowUnverifiedAdoption: config.allowUnverifiedAdoption === true,
     // 0.5：派发成功后登记，给 stale 自动重派 / 完成通知用
     dispatchRegistry,
+    // 0.6：入站唤醒限速（四道闸）。默认全关 —— 与 0.5 完全一致（不读表、不落事件）。
+    wakeConfig: {
+      wakeGuard: config.wakeGuard === true,
+      wakeMinTaskChars: config.wakeMinTaskChars,
+      wakeThreadCooldownMs: config.wakeThreadCooldownMs,
+      wakeMaxPerThread: config.wakeMaxPerThread,
+      wakeNoWake: config.wakeNoWake === true,
+    },
   });
 
   const defineTool = await loadDefineTool();
@@ -345,6 +353,15 @@ async function registerAll(ctx, config, disposers) {
         board,
         registry: dispatchRegistry,
         getInterconnect: () => interconnectOf(ctx),
+        // 0.6：完成通知优先直投本机会话（不依赖 interconnect self 路由）。
+        // 拿不到宿主服务时返回 null → lifecycle 自行降级到 interconnect。
+        getSessionController: () => {
+          try {
+            return ctx?.get?.('sessionController') ?? ctx?.sessionController ?? null;
+          } catch {
+            return null;
+          }
+        },
         instanceId: selfInstance,
         config: {
           autoRedispatch: config.autoRedispatch === true,

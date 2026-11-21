@@ -48,7 +48,8 @@
 
 | 工具 | 作用 |
 | --- | --- |
-| `mesh_peers` | 列对端实例与链路状态；`includeSessions` 再列对端活会话 |
+| `mesh_peers` | 列对端实例与链路状态；0.6 起每行带 **TCP 连通性 / 链路状态 / down 时并列候选原因**；`includeSessions` 再列对端活会话 |
+| `mesh_peer_probe` | **单点诊断**一个对端：origin / 解析后 host:port / TCP 耗时与错误 / 链路状态 / 最后错误 / ≤3 条可执行建议（0.6 新增） |
 | `mesh_task_create` | 在共享板上建任务（`requestId` 幂等） |
 | `mesh_task_list` | 列任务（按状态 / 负责人过滤）；显式标出 `STALE` / `ACK_TIMEOUT` |
 | `mesh_task_claim` | 认领 + **拿租约**（默认 10 分钟）；租约内不可被抢，stale 后可接管 |
@@ -62,11 +63,31 @@
 | `mesh_inbox` | 查看未读动态（按游标增量，不重复刷屏）；正常情况下会自动注入 |
 | `mesh_events` | 看审计事件流 |
 
-共 **13** 个工具，注册名以 `src/spec.js` 的 `TOOL_NAMES` 为准（`toolNames()` 与 `allSpecs()` 逐条对齐，
+共 **14** 个工具，注册名以 `src/spec.js` 的 `TOOL_NAMES` 为准（`toolNames()` 与 `allSpecs()` 逐条对齐，
 契约测试锁住条数）。
 
 > **为什么用 `mesh_` 而不是 `team_`**：DSH 自带的 Agent Teams 已经占了 `team_task_create` /
 > `team_task_list` 这些名字。同名注册会互相遮蔽，所以刻意避让。
+
+## 对端诊断（0.6）：`mesh_peers` 能说清"为什么 down"
+
+0.5 之前 `mesh_peers` 只给 `up` / `down`，排查"SSH 隧道指错端口"时看不出是端口不通、
+隧道断了、token 不对还是 instanceId 不匹配 —— 真实排查花了半小时。0.6 起每行补三种证据：
+
+| 字段 | 来源 | 说明 |
+| --- | --- | --- |
+| **TCP 连通性** | 本插件用 `node:net` 真连一次配置 origin 的 host:port，1s 超时 | `通（12ms）` / `不通（ECONNREFUSED…，耗时 3ms）` / `跳过（origin 是 self 解析函数）` |
+| **链路状态** | `ctx.interconnect.peers()` 的 `link` | `up` / `down`（interconnect 自己的判定） |
+| **可能原因** | 按「TCP × link」组合并列列出 | down 时列：端口不通 / 隧道断了 / token 不一致 / instanceId 不匹配 —— **区分不了就并列，不挑一个写成结论** |
+
+单个对端要看细节用 `mesh_peer_probe({ instanceId })`，返回配置 origin、解析后的 host/port、
+TCP 可达性与耗时、链路状态、最后错误（interconnect 的 `peers()` 不暴露错误字段，这里给的是本轮
+TCP 探测的具体错误；没有就如实说"无"）、≤3 条可执行建议（例如 `Test-NetConnection` 该连哪个 host:port）。
+`instanceId` 必须是已配置的键，否则报稳定码 `PEER_NOT_CONFIGURED`（即 interconnect 的
+`peer-not-configured`）——这是**配置问题**，重试本工具没有意义，应先改 interconnect 的 `peers`。
+
+> 只读边界：探测只是 TCP 连接后立即销毁 socket，不改 interconnect 源码/配置，不写任何状态；
+> 对端链路 up 时也会连一下（多一次无害的 TCP 握手），不会触发 WS 鉴权或唤醒会话。
 
 ## 四件事必须分开：投递 / 知情 / 干活 / 完成
 
@@ -184,14 +205,57 @@
 耗时 2m5s｜证据 1 条｜目标 server
 ```
 
-- 走宿主 `ctx.interconnect.send`；**同一任务只通知一次**（去重看板上 `task.notify_sent` /
-  `task.notify_failed` / `task.notify_skipped` 事件，不新增字段）。
-- 没有 interconnect 时不报错，落 `task.notify_skipped`（`reason=no-interconnect`），
-  降级为"板上事件 + 收件箱注入"——发起方下一轮仍能看到结论。
-- 送到了落 `task.notify_sent`；没送到落 `task.notify_failed`（含 `reason`），**不写成成功**。
-- **已知边界**：通知目标是"原派发方会话"，而派发方通常就在本实例上。`interconnect.send` 要寻址
-  本实例自己的会话，需要 interconnect 的 `peers` 里有以自己 `instanceId` 为键的 `self` 路由；
-  没配时 `send` 返回 `delivered:false`，本插件如实落 `task.notify_failed`（不会静默成功）。
+**0.6 起投递顺序（每步都如实落 `channel`）**：
+
+1. **本实例直投**：落点在本实例（`dispatcherInstance === 本实例 id`）时，直接用宿主
+   `sessionController.prompt(request, signal)` 把短消息投给原派发方会话，**不依赖 interconnect
+   的 `self` 路由**（0.5 的真实边界：本机 profile 没配 self，`send` 到自己的会话会
+   `delivered:false`）。成功落 `task.notify_sent`（`channel=local-session`）。
+2. **降级 interconnect**：本实例没有会话能力（没注入 `sessionController`）、或会话不活跃
+   （`prompt` 抛错，如 `session/not-found`）时，退回 0.5 的 `ctx.interconnect.send`。
+   成功落 `task.notify_sent`（`channel=interconnect`）。
+3. **都不成**：本实例直投**真的试过**且 interconnect 也没送到 → 落 `task.notify_skipped`
+   （`channel=none`，`reason` 写成 `all-channels-failed: local-session=…; interconnect=…`）；
+   本实例通道本来就不适用（远端落点 / 没会话能力）而 interconnect 没送到 → 仍按 0.5 语义落
+   `task.notify_failed`（`channel=interconnect`，含 `reason`）。**任何情况都不写成成功。**
+
+- **同一任务只通知一次**（去重看板上 `task.notify_sent` / `task.notify_failed` /
+  `task.notify_skipped` 事件，不新增字段）。
+- **已知边界**：`sessionController.prompt` 只对**本机活着的会话**有效，会话已销毁/不属于本机时
+  会失败并降级 —— 这条直投路径依赖宿主 `prompt(request, signal)` 的签名（与 `dispatcher.js`
+  建子会话同一套），**没有在真实 DSH 宿主里跑过本轮**，单测用假 sessionController 锁形。
+
+## 入站唤醒限速（0.6）：四道闸，默认全关
+
+`maxRedispatch` 限的是**派发方**的补投次数，从来没限过**接收方被反复唤醒**。调研报告记录过
+peng456 的实测事故：2.5 小时 / 54 个会话 / 800 万 token —— 就是这类循环的代价。
+0.6 在 `mesh_dispatch` **入口、任何投递动作之前**过四道闸；命中任一就**不投递**（不建远端会话、
+不发任务卡、不开 ack 窗口），返回稳定码并落审计 `dispatch.suppressed`。
+
+```yaml
+- id: dsh-team-mesh
+  config:
+    wakeGuard: false             # 总开关；关着 = 与 0.5 完全一致
+    wakeNoWake: false            # true = 静默只落板（WAKE_SILENT）
+    wakeMinTaskChars: 0          # >0 才检查：任务正文（title+brief+acceptance）少于 N 字不唤醒
+    wakeThreadCooldownMs: 0      # >0 才检查：同一目标（instance+session）冷却期内不再唤醒
+    wakeMaxPerThread: 0          # >0 才检查：同一目标累计唤醒次数上限
+```
+
+| 闸门 | 命中码 | 判定 | 说明 |
+| --- | --- | --- | --- |
+| ① 静默 | `WAKE_SILENT` | `wakeNoWake=true` | 显式"别唤醒任何接收方"，连建会话/投递都不做 |
+| ② 太短 | `WAKE_TOO_SHORT` | `wakeMinTaskChars > 0` 且 正文 < 它 | 只数**任务正文**（title+brief+acceptance），不数任务卡模板 —— 否则空壳任务永远过闸 |
+| ③ 冷却 | `WAKE_COOLDOWN` | `wakeThreadCooldownMs > 0` 且距上次唤醒不足 | 目标按 `instanceId + sessionId` 计；`newSession` 派发没有既有 thread，此闸不适用 |
+| ④ 上限 | `WAKE_LIMIT` | `wakeMaxPerThread > 0` 且累计唤醒数 ≥ 它 | 累计唤醒数同样按目标计，只在**真的投递成功**时 +1 |
+
+- **顺序固定**：SILENT → TOO_SHORT → COOLDOWN → LIMIT（静默是运维总开关，不该被别的闸的措辞盖住）。
+- **计数只在进程内**：`Map<instance\0session, {lastWakeAt, count}>`，**不新增 schema 字段、不改
+  `schema_version`、不做迁移**。代价：插件重启后计数清零（唤醒是即时风险，重启重新计数可接受）。
+- 命中后的返回文本带稳定码与处理建议（例如"把任务写具体"或"等冷却期"），事件 `dispatch.suppressed`
+  的 payload 含 `reason`（稳定码）/ `task_id` / `target_instance` / `target_session` / `chars` 等；
+  远端板禁止客户端写审计时事件降级为无（返回文本仍给稳定码）。
+- **默认全关**时行为与 0.5 完全一致：不读表、不落事件、连闸门判断都不会命中。
 
 ## 四条不变量（这是这个插件真正的价值）
 
@@ -668,7 +732,14 @@ node tools/client_cli.mjs health  # 板服务运维客户端
   不是角色系统）。
 - `mesh_dispatch` 的跟踪止于**回执 + 完成事件**：对方接了之后是否真的在干、干到哪一步，只能看共享板上的
   租约 / 证据 / 事件；0.5 起 `notifyOnComplete` 默认会在任务 `done` / `canceled` 时推一条短消息，
-  但它**不跟踪中间过程**，且通知本身依赖 interconnect 能寻址到派发方自己的会话（见下文「派发之后（0.5）」）。
+  但它**不跟踪中间过程**。0.6 起通知优先走本机会话直投（`sessionController.prompt`），本实例没有
+  会话能力/会话不活跃时才降级到 interconnect（见「派发之后（0.5）」）；直投路径依赖宿主签名，
+  **未在真实 DSH 宿主里实测**。
+- **唤醒限速的计数在进程内**（0.6）：`wakeGuard` 打开后，同一目标的冷却/上限计数存在内存 Map 里，
+  插件重启即清零。要跨重启限速得落盘，本版按"不新增字段、不做迁移"的约束**不做**。
+- **对端诊断的边界**（0.6）：`mesh_peer_probe` 的 TCP 探测只证明"这个 host:port 有人监听"，
+  证明不了"那个监听者就是这个对端实例"；token / instanceId 不一致需要看握手结果或对端日志
+  （`peers()` 不暴露最后错误字段，插件只能如实并列候选原因）。origin 是 self 解析函数时无法探测 TCP。
 - 板服务硬化后仍有边界：审计 append **不 fsync**（崩溃/断电可能丢最后几行）；限流是固定窗口
   （边界允许约 2 倍突发），按 `socket` IP + token 指纹分桶 —— 前面若加了反向代理，所有调用方会共用
   代理 IP（此时 token 指纹仍能区分密钥）。
@@ -771,6 +842,19 @@ $env:DSH_TEAM_BOARD_HOST = "127.0.0.1"
 | `notifyOnComplete` | `true` | 任务 `done` / `canceled` 时主动通知原派发方会话（≤200 字；无 interconnect 时降级落事件） |
 
 环境变量（0.5 新增）：`DSH_TEAM_STRICT=1` —— 插件加载失败时**抛出**异常让 DSH 启动失败（默认吞错并在板库同目录写 `mesh-load-error.json`，见下文「插件没加载上怎么查」）。
+
+**插件 config（0.6 新增：入站唤醒限速，默认全关）**
+
+| 开关 | 默认 | 说明 |
+| --- | --- | --- |
+| `wakeGuard` | `false` | 限速总开关；`false` 时与 0.5 完全一致（不读表、不落事件） |
+| `wakeNoWake` | `false` | 静默只落板：命中 `WAKE_SILENT`，不唤醒任何接收方 |
+| `wakeMinTaskChars` | `0`（不检查） | 任务正文（title+brief+acceptance）少于 N 字 → `WAKE_TOO_SHORT` |
+| `wakeThreadCooldownMs` | `0`（不检查） | 同一目标冷却期内再派 → `WAKE_COOLDOWN`（夹取 0–24h） |
+| `wakeMaxPerThread` | `0`（不检查） | 同一目标累计唤醒上限 → `WAKE_LIMIT`（夹取 0–10000） |
+
+> 0.6 的 `mesh_peer_probe` **没有配置项**；`mesh_peers` / `mesh_peer_probe` 的 TCP 探测超时固定 1s
+> （常量 `PEER_PROBE_TIMEOUT_MS`），不做成开关 —— 它只是诊断，不该引入新的配置面。
 
 **板服务 env（`node src/server.js` / 计划任务 `dsh-team-board`）**
 

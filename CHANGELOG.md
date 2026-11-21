@@ -9,6 +9,89 @@
 
 ---
 
+## 0.6.0（2026-11-21）
+
+本版收三项 P0 改进，全部来自调研报告（`C:\Users\ky614\mesh-research-report.md`）第 5 节：
+**对端可诊断（`mesh_peers` 补证据 + 新工具 `mesh_peer_probe`，工具数 13 → 14）**、
+**完成通知改走本机会话直投（失败再降级 interconnect）**、**入站唤醒限速四道闸（默认全关）**。
+`schema_version` 仍为 **4**，**无 schema 变更、无数据迁移**；不新增第三方依赖（只用 Node 标准库）；
+所有新配置项的默认值都按"不改变现有行为"来定 —— 不配就与 0.5 完全一致。
+
+### 新增：对端可诊断 —— `mesh_peers` 补三种证据 + `mesh_peer_probe`（P0-3）
+
+- `mesh_peers` 每行在原有 `up/down` 与 origin 之外补：**TCP 连通性**（`node:net` 真连一次
+  origin 的 host:port，1s 超时，带耗时/错误码）、**链路状态**（`interconnect.peers()` 的 `link`）、
+  **可能原因**（down 时并列列出端口不通 / 隧道断了 / token 不一致 / instanceId 不匹配，
+  区分不了就并列并标注"本行 TCP 证据能排除什么"，**不瞎猜单一原因**）。
+- 新工具 `mesh_peer_probe({ instanceId })`：单点探测，返回配置 origin、解析后 host/port、
+  TCP 可达性（耗时/错误）、链路状态、最后错误信息（interconnect `peers()` 不暴露错误字段，
+  给的是本轮 TCP 的具体错误；没有就如实说无）、≤3 条可执行建议。
+  `instanceId` 未配置时报稳定码 `PEER_NOT_CONFIGURED`（即 `peer-not-configured`）。
+- 边界：只读探测（连上即销毁 socket），不改 interconnect 源码/配置、不写状态；
+  origin 是 self 解析函数时无法做 TCP 探测，如实标"跳过"。
+- 测试（`test/peer_probe.test.mjs`，10 条）：真 `node:net` server 当"通"、刚关闭端口当"不通"；
+  TCP 通/不通两种 / 未配置 instanceId 报 `peer-not-configured` / 输出含三种诊断字段 /
+  self 解析函数不崩 / 非法 origin 不编 host:port / 契约锁工具总数 14。
+
+### 改进：完成通知改走本机会话直投（P0-1）
+
+- 0.5 的通知只有一条路：`ctx.interconnect.send` 发给原派发方会话。派发方通常就在**本实例**，
+  要寻址自己的会话需要 interconnect `peers` 里有 `self` 路由（本机没配），真实环境预期落
+  `task.notify_failed`。0.6 起按顺序尝试：
+  ① 落点在本实例 → 宿主 `sessionController.prompt(request, signal)` **直投本机会话**；
+  ② 直投不可用/会话不活跃（`prompt` 抛错）→ 降级 `ctx.interconnect.send`（0.5 路径）；
+  ③ 都不成 → 落 `task.notify_skipped`（`reason=all-channels-failed: local-session=…; interconnect=…`）。
+- 每次投递结果都带 **`channel`** 字段：`local-session` / `interconnect` / `none`；
+  "本实例通道本来就不适用（远端落点 / 没有 sessionController）且 interconnect 没送到"仍按
+  0.5 语义落 `notify_failed`（`channel=interconnect`），"没送到"与"根本没法投"保持可区分。
+- 回执落点仍由 0.5 的进程内登记表记录（任务号 / 目标 instance+session / 本实例 id / 派发方会话 id），
+  只有 `mesh_dispatch` **真的投递成功**才登记；同一任务只通知一次（去重沿用板上 `task.notify_*`）。
+- 测试（`test/notify_local.test.mjs`，5 条）：本实例直投成功（不发 interconnect、正文 ≤200 字）/
+  本实例不活跃降级到 interconnect / 两者皆失败落 skipped（reason 写清两边、含 channel=none）/
+  远端落点不走直投 / 没有 sessionController 且没有 interconnect 仍是 0.5 的 skipped 语义。
+
+### 新增：入站唤醒限速四道闸（P0-2，默认全关）
+
+- 新增配置：`wakeGuard`（默认 `false` 总开关）、`wakeMinTaskChars`（默认 `0` 不检查）、
+  `wakeThreadCooldownMs`（默认 `0`）、`wakeMaxPerThread`（默认 `0`）、`wakeNoWake`（默认 `false`）。
+- 闸门在 `mesh_dispatch` **入口、任何投递/建会话动作之前**依次判断（顺序固定：
+  SILENT → TOO_SHORT → COOLDOWN → LIMIT）；命中任一就**不投递**，返回稳定码
+  `WAKE_SILENT` / `WAKE_TOO_SHORT` / `WAKE_COOLDOWN` / `WAKE_LIMIT`，并落审计事件
+  `dispatch.suppressed`（payload 含 `reason`（稳定码）/ `task_id` / `target_instance` /
+  `target_session` / `chars` / `min_chars` / `remaining_ms` / `wake_count` / `max_wakes`）。
+- 计数只在**真的投递成功**时 +1；进程内 `Map`，**不新增 schema 字段、不改 `schema_version`**、
+  不做数据迁移（代价：插件重启计数清零，已写进 README 已知限制）。
+- `newSession` 派发没有既有 thread，冷却/上限闸不适用；`WAKE_SILENT` / `WAKE_TOO_SHORT` 仍生效。
+- **关闭（默认）时与 0.5 完全一致**：不读表、不落事件、没有闸门判断命中。
+- 测试（`test/wake_guard.test.mjs`，11 条）：四道闸各一条 / 命中不投递且落事件 /
+  默认全关不触发（连事件都不多一条）/ 非布尔 `true` 不算开 / 投递失败不计唤醒 /
+  闸门顺序 / 配置规整与正文计数口径。
+
+### 版本与验证
+
+- 版本 `0.5.0` → `0.6.0`，三处同步：`package.json` `version`、`dsh.plugin.json` `version`、
+  `src/index.js` `PLUGIN_VERSION`。
+- 全量单测：**289 / 289 通过、0 失败**（原 263 条一条没红；新增 26 条：`peer_probe` 10、
+  `notify_local` 5、`wake_guard` 11）。契约测试显式钉住工具总数 **14** 与
+  `TOOL_NAMES.probe === 'mesh_peer_probe'`。
+- **变异验证（证明新测试不是摆设，均先备份、后还原并校验字节一致）**：
+  1. P0-3：关掉 `mesh_peer_probe` 的 `peer-not-configured` 判定 → `peer_probe` **1 条红**
+     （未配置 instanceId 用例）；
+  2. P0-1：关掉"本实例直投"分支 → `notify_local` **3 条红**（直投成功 / 降级 / 皆失败三条）；
+  3. P0-2：让四道闸永不生效 → `wake_guard` **5 条红**（四道闸各一条 + 闸门顺序）。
+- 未验证（本版不替它背书，单列如下）：
+  1. **没有在真实 DSH 宿主里跑过 0.6**：本版只在本仓跑单测，没重启任何 DSH；运行中的插件仍是 0.5。
+  2. **本机会话直投没有真机实测**：`sessionController.prompt(request, signal)` 的签名是对着
+     app.asar 与 `dispatcher.js` 已有用法核对的，`sessionController` 用假对象锁形；
+     "会话不活跃时 `prompt` 抛稳定错误"这一行为**未在活宿主复现**。
+  3. **`mesh_peers` / `mesh_peer_probe` 的 TCP 探测只在 127.0.0.1 上测过**（真 server / 真关闭端口）：
+     跨机链路（EasyTier/VNT 隧道、防火墙 drop）的超时表现、以及链路 up 时探测是否会在对端
+     webServer 日志里留下无害噪声，**均未实测**。
+  4. **唤醒限速的事件落盘未在远端板验证**：远端板禁止客户端写审计（`REMOTE_AUDIT_READONLY`），
+     `dispatch.suppressed` 在远端模式下降级为无事件（返回文本仍给稳定码），这条没对真实板服务跑过。
+  5. **进程内计数不跨重启**：`wakeThreadCooldownMs` / `wakeMaxPerThread` 的账本在内存里，
+     插件重启后清零；本版按"不新增字段、不做迁移"的约束不做持久化。
+
 ## 0.5.0（2026-11-21）
 
 本版收三件事：**修掉 0.4 遗留的"加载失败静默空壳"缺陷**、**stale 任务自动重派（默认关）**、

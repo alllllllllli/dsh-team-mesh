@@ -15,6 +15,20 @@ import {
   validateCreateInput,
 } from './domain.js';
 import { collectInbox } from './inbox.js';
+import {
+  diagnosePeer,
+  peerCauseCandidates,
+  probePeer,
+  renderTcp,
+} from './diagnose.js';
+import { appendAudit } from './dispatcher.js';
+import {
+  createWakeLedger,
+  DISPATCH_SUPPRESSED_EVENT,
+  evaluateWakeGate,
+  normalizeWakeConfig,
+  renderSuppressedText,
+} from './wakeGuard.js';
 import { instanceIdOf, sessionIdOf } from './session.js';
 import { NEW_SESSION_ACK_FLOOR_MS } from './spec.js';
 
@@ -201,6 +215,17 @@ function fmtTime(ms) {
   }
 }
 
+/**
+ * peer.origin 的展示值。
+ * interconnect 的 `peers()` 里 `origin` 可能是 **self 路由的解析函数**（公开形态），
+ * 直接 `${origin}` 会打出一段源码 —— 这里如实标成"无固定 host:port"。
+ */
+function describeOrigin(origin) {
+  if (typeof origin === 'string') return origin;
+  if (typeof origin === 'function') return '（self 解析函数，无固定 host:port）';
+  return String(origin);
+}
+
 function lifecycleLabel(lifecycle) {
   const map = {
     open: '待认领',
@@ -294,6 +319,14 @@ export function createHandlers(deps) {
   const dispatchRegistry = deps.dispatchRegistry ?? null;
 
   /**
+   * 0.6：入站唤醒限速（四道闸）。默认全关 —— 不传配置时 normalize 出来的就是
+   * "wakeGuard:false"，`mesh_dispatch` 行为与 0.5 完全一致（连一次闸门判断的开销都省在真值上）。
+   * 计数只在**真的投递成功**后记，进程内 Map，不落板、不加字段。
+   */
+  const wakeConfig = normalizeWakeConfig(deps.wakeConfig);
+  const wakeLedger = deps.wakeLedger ?? createWakeLedger();
+
+  /**
    * 本实例配置的总管会话（可能为空）。
    * 测试直接构造 handlers 时不传这个依赖 → 空数组，旧的认领行为一字不差。
    */
@@ -352,9 +385,26 @@ export function createHandlers(deps) {
         ].join('\n');
       }
 
+      // 0.6：并行探活（每行 1s 上限，串行会把 N 个 down 的对端叠成 N 秒）。
+      // 探测失败一律不抛：这是诊断信息，不能因此让整个工具失败。
+      const probed = await Promise.all(rows.map((p) => probePeer(p)));
+
       const lines = [`本实例：${instanceIdOf(interconnect, sessionIdOf(exec))}`, `对端 ${rows.length} 个：`];
-      for (const p of rows) {
-        lines.push(`  ${p.instanceId}  ${p.link}  ${p.origin}`);
+      for (let i = 0; i < rows.length; i += 1) {
+        const p = rows[i];
+        const got = probed[i];
+        const link = typeof p?.link === 'string' ? p.link : 'unknown';
+        lines.push(`  ${p.instanceId}  ${link}  ${describeOrigin(p.origin)}`);
+        lines.push(`    TCP：${renderTcp(got.tcp)}｜链路：${link}（interconnect peers()）`);
+        // down 或 TCP 不通时并列候选原因；**区分不了就并列**，不挑一个写成结论
+        if (link !== 'up' || got.tcp?.reachable !== true) {
+          const causes = peerCauseCandidates({ tcp: got.tcp, link });
+          if (causes.length > 0) {
+            lines.push('    可能原因（无法区分，以下并列）：');
+            for (const cause of causes) lines.push(`      - ${cause}`);
+            lines.push(`    单点详情：mesh_peer_probe({ instanceId: "${p.instanceId}" })`);
+          }
+        }
         if (args?.includeSessions === true) {
           if (p.link !== 'up') {
             lines.push('    链路未通，列不出会话');
@@ -380,6 +430,56 @@ export function createHandlers(deps) {
           }
         }
       }
+      return lines.join('\n');
+    },
+
+    async mesh_peer_probe(args) {
+      const instanceId = assertNonEmptyString(args?.instanceId, 'instanceId', 256);
+      const interconnect = getInterconnect();
+      if (interconnect === null || typeof interconnect !== 'object') {
+        return [
+          '本实例上没有 interconnect 服务，无法探测对端。',
+          '（dsh-interconnect 插件未启用，或它的服务尚未激活。）',
+        ].join('\n');
+      }
+
+      let rows;
+      try {
+        rows = interconnect.peers();
+      } catch (err) {
+        return `读 peer 列表失败：${err?.message ?? String(err)}`;
+      }
+      const list = Array.isArray(rows) ? rows : [];
+      const peer = list.find((p) => p?.instanceId === instanceId);
+      if (peer === undefined) {
+        // 稳定码：与 interconnect 的 send 失败码同名。这是**配置问题**，重试本工具没有意义。
+        const configured = list.length === 0 ? '（peers 一个都没配）' : list.map((p) => p.instanceId).join(', ');
+        throw new TeamError(
+          'PEER_NOT_CONFIGURED',
+          `peer-not-configured：本实例 peers 里没有 "${instanceId}"。已配置：${configured}。` +
+            '先改 dsh-interconnect 的 peers 配置（键 = 对端 instanceId），再重试；不要重复调用本工具。',
+        );
+      }
+
+      const probed = await probePeer(peer);
+      const diagnosis = diagnosePeer(probed);
+      const parsed = probed.parsed;
+      const lines = [
+        `对端探测：${instanceId}`,
+        `  配置 origin：${describeOrigin(peer.origin)}`,
+        `  解析 host/port：${
+          parsed.ok === true ? `${parsed.host}:${parsed.port}（scheme=${parsed.scheme}）` : `无法解析 —— ${parsed.reason}`
+        }`,
+        `  TCP 可达性：${renderTcp(probed.tcp)}`,
+        `  链路状态：${diagnosis.link}（来自 interconnect peers()）`,
+        `  最后错误：${diagnosis.lastError ?? '无（interconnect 的 peers() 不暴露最后错误字段）'}`,
+      ];
+      if (diagnosis.causes.length > 0) {
+        lines.push('', '可能原因（无法区分，以下并列）：');
+        for (const cause of diagnosis.causes) lines.push(`  - ${cause}`);
+      }
+      lines.push('', '诊断建议：');
+      diagnosis.suggestions.slice(0, 3).forEach((hint, i) => lines.push(`  ${i + 1}. ${hint}`));
       return lines.join('\n');
     },
 
@@ -686,6 +786,48 @@ export function createHandlers(deps) {
         throw new TeamError('INVALID_FIELD', `delivery 必须是 ${DELIVERY_MODES.join(' / ')} 之一`);
       }
 
+      // ── 0.6：入站唤醒限速（四道闸）──
+      // 位置必须在**任何投递/建会话动作之前**：命中就不该建远端会话、不该发任务卡、
+      // 不该开 ack 窗口（"拦下"与"送到没人管"是两种完全不同的结论）。
+      const wakeHit = evaluateWakeGate({
+        task,
+        instanceId,
+        sessionId: wantsNewSession ? null : givenSessionId,
+        newSession: wantsNewSession,
+        now: Date.now(),
+        config: wakeConfig,
+        ledger: wakeLedger,
+      });
+      if (wakeHit !== null) {
+        const payload = {
+          // reason 用稳定码（可按码分流），message 给人看
+          reason: wakeHit.code,
+          code: wakeHit.code,
+          message: wakeHit.reason,
+          task_id: taskId,
+          target_instance: instanceId,
+          target_session: wantsNewSession ? null : givenSessionId,
+          new_session: wantsNewSession,
+          chars: wakeHit.chars,
+          min_chars: wakeHit.min_chars ?? null,
+          remaining_ms: wakeHit.remaining_ms ?? null,
+          wake_count: wakeHit.wake_count ?? null,
+          max_wakes: wakeHit.max_wakes ?? null,
+        };
+        // 尽力落审计（远端板禁止客户端写审计时降级为无事件——但返回文本仍给稳定码）
+        await appendAudit(board, DISPATCH_SUPPRESSED_EVENT, taskId, sessionIdOf(exec), payload);
+        return [
+          `**未派发（入站唤醒限速拦下）**：${instanceId}${wantsNewSession ? ' / <new-session>' : ` / ${givenSessionId ?? '?'}`}`,
+          `  原因码：${wakeHit.code}`,
+          `  说明：${wakeHit.reason}`,
+          `  任务：${task.task_id} ${task.title}`,
+          '',
+          `处理：${renderSuppressedText(wakeHit)}`,
+          '审计事件：dispatch.suppressed（含 reason / task / target）。',
+          '**这次没有投递，也没有偷偷改投别的会话。**',
+        ].join('\n');
+      }
+
       // 回执窗口：只在 newSession 时套下限；普通派发与 0.3.x 一致（默认 60s）。
       // 建会话等待另算 —— 它仍用 args.ackTimeoutMs 原值（缺省 60s），不跟这个下限走。
       const requestedAckMs = resolveAckWindowMs({ ackTimeoutMs: args?.ackTimeoutMs, newSession: false });
@@ -749,18 +891,23 @@ export function createHandlers(deps) {
       // 0.5：登记"本实例派出过这条任务"，给 stale 自动重派 / 完成主动通知用。
       // 只在**真的送到**时登记：没送到的派发不存在"派发方在等它做完"这件事。
       // 登记失败只影响这两项新功能，绝不改变本次派发的结论。
-      if (result.delivered === true && dispatchRegistry !== null) {
-        try {
-          dispatchRegistry.record?.(taskId, {
-            peerInstance: instanceId,
-            peerSession: sessionId,
-            dispatcherInstance: instanceIdOf(interconnect, sessionIdOf(exec)),
-            dispatcherSession: sessionIdOf(exec),
-            dispatchedAt: Date.now(),
-          });
-        } catch {
-          /* ignore */
+      // 0.6：同一次"真的送到"也算一次**入站唤醒**（限速账本只在投递成功后计数）。
+      // 只有 wakeGuard 打开时才记账 —— 默认关闭时连一个 Map 条目都不该多出来。
+      if (result.delivered === true) {
+        if (dispatchRegistry !== null) {
+          try {
+            dispatchRegistry.record?.(taskId, {
+              peerInstance: instanceId,
+              peerSession: sessionId,
+              dispatcherInstance: instanceIdOf(interconnect, sessionIdOf(exec)),
+              dispatcherSession: sessionIdOf(exec),
+              dispatchedAt: Date.now(),
+            });
+          } catch {
+            /* ignore */
+          }
         }
+        if (wakeConfig.wakeGuard === true) wakeLedger.note(instanceId, sessionId, Date.now());
       }
 
       if (result.delivered === true) {

@@ -80,7 +80,7 @@ test('默认模式：加载失败不抛错、返回可调用 disposer，并写�
 
     assert.ok(!Number.isNaN(Date.parse(body.time)), 'time 必须是可解析的 ISO 时间');
     assert.equal(body.version, PLUGIN_VERSION);
-    assert.equal(body.version, '0.5.0');
+    assert.match(body.version, /^0\.\d+\.\d+$/, '诊断文件里的版本号必须来自 PLUGIN_VERSION，不写死字面量');
     assert.equal(body.boardEndpoint, null, '单机模式没有 boardEndpoint，不该编一个');
     assert.match(String(body.error.message), /dsh-tools/, 'error.message 要能说明是哪一步失败');
     assert.ok(typeof body.error.stack === 'string' && body.error.stack.length > 0);

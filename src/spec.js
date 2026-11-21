@@ -27,6 +27,8 @@ export const TOOL_NAMES = {
   inbox: 'mesh_inbox',
   // 0.4：三证据收养（比 claim 更安全的 stale 接管路径）
   adopt: 'mesh_task_adopt',
+  // 0.6：单点探测（mesh_peers 给全量概览，probe 给一个对端的细节）
+  probe: 'mesh_peer_probe',
 };
 
 /**
@@ -57,11 +59,42 @@ export function peersSpec() {
       '',
       '这是跨 DSH 协作的第一步：不知道有哪些实例、哪些会话活着，就没法派任务。',
       '链路 down 的对端仍然会列出来（它配了但暂时连不上），不要把它当成"不存在"。',
+      '',
+      '0.6 起每行还带诊断信息：**TCP 连通性**（真连一次 origin 的 host:port，1s 超时）、',
+      '**链路状态**（interconnect peers() 的 up/down）、以及 down 时并列列出的**可能原因**',
+      '（端口不通 / 隧道断了 / token 不一致 / instanceId 不匹配）。',
+      '想深挖某一个对端时用 mesh_peer_probe，它会给出耗时、最后错误与可执行建议。',
     ].join('\n'),
     parameters: {
       includeSessions: {
         type: 'boolean',
         description: '是否附带每个可达对端的活会话列表（默认 false：只列链路）',
+      },
+    },
+    output: textOut,
+  };
+}
+
+export function probeSpec() {
+  return {
+    name: TOOL_NAMES.probe,
+    description: [
+      '**单点诊断**一个对端实例：mesh_peers 说它 down 时，用这个看细节。',
+      '',
+      '返回：配置 origin、解析后的 host/port、**真实 TCP 连通性（含耗时与错误码）**、',
+      'interconnect 链路状态、最后错误信息（有就给，没有就如实说）、≤3 条可执行诊断建议。',
+      '',
+      '能区分的：端口不通 / 隧道断了（TCP 层证据）；TCP 通但链路 down（多为 token 或 instanceId 问题）。',
+      '不能区分的：TCP 不通时，token 与 instanceId 都没法验证 —— 输出会并列说明，不瞎猜单一原因。',
+      '',
+      'instanceId 必须是 peers 里配置过的键；没配置会报 `peer-not-configured`（稳定码），',
+      '这种情况不该重试，应先改 interconnect 配置。',
+    ].join('\n'),
+    parameters: {
+      instanceId: {
+        type: 'string',
+        required: true,
+        description: '要探测的对端实例 id（来自 mesh_peers；必须是已配置的键）',
       },
     },
     output: textOut,
@@ -282,6 +315,11 @@ export function dispatchSpec() {
       '结果是"送到了没人管"，不是"正常"。',
       '',
       '默认不唤醒对方已休眠的会话（唤醒会真的花对方的模型额度）。确实要唤醒时把 resume 设为 true。',
+      '',
+      '0.6 起本实例可配置**入站唤醒限速**（wakeGuard / wakeMinTaskChars / wakeThreadCooldownMs /',
+      'wakeMaxPerThread / wakeNoWake，默认全关）。命中闸门时**不会投递**，返回稳定码',
+      'WAKE_TOO_SHORT / WAKE_COOLDOWN / WAKE_LIMIT / WAKE_SILENT，并落审计事件 dispatch.suppressed。',
+      '这是配置命中，不是投递失败；按返回里的处理建议改参数或改配置，不要原样重试。',
     ].join('\n'),
     parameters: {
       taskId: { type: 'string', required: true, description: '要派的任务 id' },
@@ -424,5 +462,6 @@ export function allSpecs() {
     heartbeatSpec(),
     inboxSpec(),
     adoptSpec(),
+    probeSpec(),
   ];
 }

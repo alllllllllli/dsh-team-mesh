@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 契约测试：**拿宿主真实的 `defineTool`** 编译全部 spec，再用一个假 ctx 真跑 apply。
  *
  * 为什么这一步不能省：schema 用了宿主不认的关键字时，`ctx.tools.register()` 会在
@@ -50,9 +50,11 @@ async function realDefineTool() {
 test('全部 spec 都能被宿主真实的 defineTool 编译（这一步失败就等于应用起不来）', async () => {
   const defineTool = await realDefineTool();
   const specs = allSpecs();
-  // 不写死数字：以 TOOL_NAMES 为准，防止加了工具忘记同步测试
+  // 不写死数字：以 TOOL_NAMES 为准，防止加了工具忘记同步测试。
+  // 但**总数本身**是 0.6 的验收项（13 → 14，新增 mesh_peer_probe），这里显式钉住。
+  assert.equal(TOOL_NAMES.probe, 'mesh_peer_probe');
+  assert.equal(specs.length, 14, `0.6 起工具总数应为 14，实际 ${specs.length}`);
   assert.equal(specs.length, Object.keys(TOOL_NAMES).length);
-  assert.ok(specs.length >= 12, `工具数不应少于 12（v2 含 ack/heartbeat/inbox），实际 ${specs.length}`);
 
   for (const spec of specs) {
     const tool = defineTool({ ...spec, execute: async () => 'ok' });

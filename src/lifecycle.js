@@ -18,10 +18,15 @@
  *   - 远端板上客户端**不能写审计**（REMOTE_AUDIT_READONLY）：`task.redispatched` / `task.notify_*`
  *     只在本地板可写时落盘；远端模式下降级为本机 warn，重派次数用进程内计数兜底（仍受
  *     `maxRedispatch` 约束，不会每轮重复重派）。
- *   - 通知走 `ctx.interconnect.send` 到**原派发方会话**。本实例要能寻址自己的会话，interconnect
- *     的 `peers` 里需要有以自己 instanceId 为键的 `self` 路由；没有时 `send` 返回
- *     `delivered:false`，本模块如实落 `task.notify_failed`（**不写成成功**）。
+ *   - 通知**优先直投本机会话**（0.6）：落点在本实例时走宿主 `sessionController.prompt`，
+ *     不依赖 interconnect 的 `self` 路由；会话不活跃/宿主没有该服务时才降级到
+ *     `ctx.interconnect.send`（0.5 路径），都失败如实落 `task.notify_skipped`。
+ *     `channel` 字段标明实际走的是 `local-session` / `interconnect` / `none`。
+ *   - 直投路径依赖宿主 `sessionController.prompt(request, signal)` 的签名（与 dispatcher.js
+ *     建子会话同一套）；**没有在真实 DSH 宿主里跑过本轮**，单测用假 sessionController 锁形。
  */
+import { randomUUID } from 'node:crypto';
+
 import { formatTaskCard } from './domain.js';
 import { appendAudit, payloadOf } from './dispatcher.js';
 
@@ -199,6 +204,61 @@ function usableInterconnect(interconnect) {
   return interconnect !== null && typeof interconnect === 'object' && typeof interconnect.send === 'function';
 }
 
+/**
+ * 会话直投能力是否存在。宿主没注入 sessionController 时返回 null ——
+ * **不猜**其它入口，直接降级到 interconnect（与 0.5 行为一致）。
+ */
+function sessionControllerOf(getSessionController) {
+  if (typeof getSessionController !== 'function') return null;
+  try {
+    const sc = getSessionController();
+    return sc !== null && typeof sc === 'object' ? sc : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 0.6：**本会话直投**——把完成通知直接 prompt 给本机上原派发方会话。
+ *
+ * 为什么需要它：0.5 的完成通知用 `interconnect.send` 发给"原派发方会话"；
+ * 但派发方通常就在**本实例**，本实例要寻址自己的会话，interconnect 的 peers 里
+ * 必须有以自己 instanceId 为键的 self 路由（本机 profile 没配），真实环境会落
+ * `delivered:false` → `task.notify_failed`。宿主的 sessionController 本来就能给
+ * **活着的本地会话**投消息，这条路径不依赖任何网络配置。
+ *
+ * 会话不活跃怎么办：`sc.prompt` 内部会 `resolveAgent(sessionId)`，对不存在/已销毁的
+ * 会话会抛稳定错误 —— 这里接住、标成 `attempted:true`，由调用方降级到 interconnect。
+ * **绝不**因为投递失败就假装通知成功。
+ *
+ * @returns {Promise<{ok:boolean, attempted:boolean, reason:string|null}>}
+ *   `attempted=false` 表示"这条通道根本不存在/不适用"，用于区分
+ *   "试了没成"（both-failed → skipped）与"没试"（interconnect 没送到 → failed，0.5 语义）。
+ */
+async function deliverLocalSession({ sc, sessionId, text }) {
+  if (sc === null || typeof sc.prompt !== 'function') {
+    return { ok: false, attempted: false, reason: 'no-session-controller' };
+  }
+  try {
+    await sc.prompt(
+      {
+        requestId: randomUUID(),
+        sessionId,
+        mode: 'queue',
+        content: [{ type: 'text', text }],
+      },
+      // 宿主 `prompt(request, signal)` 的第二个参数是**必填 AbortSignal**
+      // （与 dispatcher.js 里建子会话用的是同一个签名）；少传在真实宿主里必炸。
+      new AbortController().signal,
+    );
+    return { ok: true, attempted: true, reason: null };
+  } catch (err) {
+    const code = typeof err?.code === 'string' && err.code.length > 0 ? err.code : null;
+    const message = err?.message ?? String(err);
+    return { ok: false, attempted: true, reason: code === null ? message : `${code}: ${message}` };
+  }
+}
+
 function warn(logger, message) {
   try {
     logger?.warn?.(`[dsh-team-mesh] ${message}`);
@@ -212,11 +272,18 @@ function warn(logger, message) {
  *
  * 去重分两层：先看板上 `task.notify_*` 事件（跨进程/跨轮次都算数），再用进程内 state 兜底
  * （远端板写不了审计时，板上事件这条依据不存在，不兜底就会每轮重复通知）。
- * 通知结果如实落事件：送到了 → `task.notify_sent`；没送到 → `task.notify_failed`（含 reason）；
- * 没有 interconnect → `task.notify_skipped`（reason=no-interconnect）。
+ *
+ * 0.6 起投递顺序（每步都如实落 `channel`）：
+ *   ① 落点在本实例（`entry.dispatcherInstance === 本实例 id`）→ 用宿主 `sessionController.prompt`
+ *      直投本机会话 → `notify_sent`（channel=local-session）；
+ *      会话不活跃/没有 sessionController → 降级（不抛、不假装成功）；
+ *   ② 降级 `ctx.interconnect.send` → `notify_sent`（channel=interconnect）；
+ *   ③ 本地试过但失败 **且** interconnect 也没成 → `notify_skipped`（channel=none，reason 写清两边）；
+ *      本地通道不存在（远端落点 / 没 sessionController）而 interconnect 没送到 → 仍按 0.5 语义
+ *      落 `notify_failed`（channel=interconnect），保持"没送到"与"根本没法投"可区分。
  */
 async function notifyCompletion(opts) {
-  const { board, entry, task, state, getInterconnect, logger, actor } = opts;
+  const { board, entry, task, state, getInterconnect, getSessionController, logger, actor } = opts;
   const taskId = task.task_id;
   if (state.notified.has(taskId)) return { skipped: 'already-attempted' };
 
@@ -241,18 +308,10 @@ async function notifyCompletion(opts) {
     || typeof dispatcherInstance !== 'string' || dispatcherInstance.length === 0) {
     await appendAudit(board, LIFECYCLE_EVENT_KINDS.notifySkipped, taskId, actor, {
       ...base,
+      channel: 'none',
       reason: 'no-dispatcher-target',
     });
     return { skipped: 'no-dispatcher-target' };
-  }
-
-  const interconnect = getInterconnect();
-  if (!usableInterconnect(interconnect)) {
-    await appendAudit(board, LIFECYCLE_EVENT_KINDS.notifySkipped, taskId, actor, {
-      ...base,
-      reason: 'no-interconnect',
-    });
-    return { skipped: 'no-interconnect' };
   }
 
   const detail = await terminalDetail(board, task);
@@ -264,33 +323,96 @@ async function notifyCompletion(opts) {
     peerInstance: entry.peerInstance,
   });
 
-  let sent;
-  try {
-    sent = await interconnect.send({
-      instanceId: dispatcherInstance,
+  // ── ① 本实例直投（只有在"落点就是本实例"时才走）──
+  const selfId = typeof actor === 'string' && actor.length > 0 ? actor : 'unknown';
+  const localTarget = selfId !== 'unknown' && dispatcherInstance === selfId;
+  let localAttempt = { ok: false, attempted: false, reason: 'not-local-target' };
+  if (localTarget) {
+    localAttempt = await deliverLocalSession({
+      sc: sessionControllerOf(getSessionController),
       sessionId: dispatcherSession,
       text,
     });
-  } catch (err) {
-    sent = { delivered: false, reason: `exception: ${err?.message ?? String(err)}` };
+  }
+  if (localAttempt.ok) {
+    await appendAudit(board, LIFECYCLE_EVENT_KINDS.notifySent, taskId, actor, {
+      ...base,
+      channel: 'local-session',
+      delivered: true,
+      reason: null,
+      duration_ms: detail.durationMs,
+      evidence_count: detail.evidenceCount,
+      chars: text.length,
+    });
+    return { notified: { taskId, lifecycle: task.lifecycle, channel: 'local-session' } };
   }
 
-  const delivered = sent?.delivered === true;
-  const payload = {
+  // ── ② 降级 interconnect（0.5 路径）──
+  const interconnect = getInterconnect();
+  const interconnectUsable = usableInterconnect(interconnect);
+  let sent = { delivered: false, reason: 'no-interconnect' };
+  if (interconnectUsable) {
+    try {
+      sent = await interconnect.send({
+        instanceId: dispatcherInstance,
+        sessionId: dispatcherSession,
+        text,
+      });
+    } catch (err) {
+      sent = { delivered: false, reason: `exception: ${err?.message ?? String(err)}` };
+    }
+  }
+  const interconnectReason = sent?.reason ?? (interconnectUsable ? 'undelivered' : 'no-interconnect');
+  const interconnectPayload = {
     ...base,
-    delivered,
-    reason: sent?.reason ?? null,
+    delivered: sent?.delivered === true,
+    reason: interconnectReason,
     duration_ms: detail.durationMs,
     evidence_count: detail.evidenceCount,
     chars: text.length,
   };
-  if (delivered) {
-    await appendAudit(board, LIFECYCLE_EVENT_KINDS.notifySent, taskId, actor, payload);
-    return { notified: { taskId, lifecycle: task.lifecycle } };
+
+  if (sent?.delivered === true) {
+    await appendAudit(board, LIFECYCLE_EVENT_KINDS.notifySent, taskId, actor, {
+      ...interconnectPayload,
+      channel: 'interconnect',
+    });
+    return { notified: { taskId, lifecycle: task.lifecycle, channel: 'interconnect' } };
   }
-  warn(logger, `任务 ${taskId} 完成通知没送到：${payload.reason ?? 'unknown'}`);
-  await appendAudit(board, LIFECYCLE_EVENT_KINDS.notifyFailed, taskId, actor, payload);
-  return { failed: { taskId, reason: payload.reason } };
+
+  // ── ③ 都不成 ──
+  // ③a 本实例直投**真的试过**（会话不活跃/宿主报错）且 interconnect 也没成 → 两条路都断了
+  if (localAttempt.attempted) {
+    const reason = `all-channels-failed: local-session=${localAttempt.reason}; interconnect=${interconnectReason}`;
+    warn(logger, `任务 ${taskId} 完成通知两条通道都失败：${reason}`);
+    await appendAudit(board, LIFECYCLE_EVENT_KINDS.notifySkipped, taskId, actor, {
+      ...interconnectPayload,
+      channel: 'none',
+      local_reason: localAttempt.reason,
+      interconnect_reason: interconnectReason,
+      reason,
+    });
+    return { skipped: reason };
+  }
+
+  // ③b 本实例通道不存在（远端落点 / 没 sessionController）且没有 interconnect：
+  //     这是 0.5 的既有降级语义，reason 保持 no-interconnect（不改变旧行为）。
+  if (!interconnectUsable) {
+    await appendAudit(board, LIFECYCLE_EVENT_KINDS.notifySkipped, taskId, actor, {
+      ...interconnectPayload,
+      channel: 'none',
+      reason: 'no-interconnect',
+    });
+    return { skipped: 'no-interconnect' };
+  }
+
+  // ③c interconnect 试了但没送到（本实例通道不存在或远端落点）→ 0.5 的 notify_failed
+  warn(logger, `任务 ${taskId} 完成通知没送到：${interconnectReason}`);
+  await appendAudit(board, LIFECYCLE_EVENT_KINDS.notifyFailed, taskId, actor, {
+    ...interconnectPayload,
+    channel: 'interconnect',
+  });
+  return { failed: { taskId, reason: interconnectReason } };
 }
 
 /**
@@ -435,6 +557,10 @@ export async function serviceLifecycle(deps = {}) {
     redispatchAttempts: new Map(),
   };
   const getInterconnect = typeof deps.getInterconnect === 'function' ? deps.getInterconnect : () => null;
+  // 0.6：本实例直投能力（宿主 sessionController）。拿不到就 null → 降级 interconnect。
+  const getSessionController = typeof deps.getSessionController === 'function'
+    ? deps.getSessionController
+    : () => null;
   const logger = deps.logger;
   const actor = typeof deps.instanceId === 'string' && deps.instanceId.length > 0 ? deps.instanceId : 'unknown';
 
@@ -460,7 +586,9 @@ export async function serviceLifecycle(deps = {}) {
     const terminal = task.lifecycle === 'done' || task.lifecycle === 'canceled';
     if (terminal) {
       if (notifyOnComplete) {
-        const outcome = await notifyCompletion({ board, entry, task, state, getInterconnect, logger, actor });
+        const outcome = await notifyCompletion({
+          board, entry, task, state, getInterconnect, getSessionController, logger, actor,
+        });
         if (outcome.skipped !== undefined) result.notifySkipped.push({ taskId, reason: outcome.skipped });
         if (outcome.notified !== undefined) result.notified.push(outcome.notified);
         if (outcome.failed !== undefined) result.notifyFailed.push(outcome.failed);
