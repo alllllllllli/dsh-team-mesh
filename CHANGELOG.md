@@ -9,6 +9,96 @@
 
 ---
 
+## 0.7.0（2026-11-21）
+
+**向官方 Agent Teams 对齐任务语义（依赖 / 写域 / 乐观并发），新增 noWait 禁等待守卫，
+并对 0.6.1 板服务做能力探测式兼容。** `schema_version` 4 → **5**（新增两列，幂等迁移）；
+不新增第三方依赖；工具总数仍 **14**（无新工具，只加可选参数与文案）。
+
+### 新增：任务依赖 `blockedBy`（`mesh_task_create`）
+
+- 可选 `blockedBy: string[]`。**照官方 `task-view.ts` 的 `taskReady`**：所有 blocker 都
+  `completed`（本插件 = `done`）才 ready。`canceled` 不算完成（官方只认 completed，本插件同样不把
+  "取消"当"做完"），所以创建时拒绝让已取消任务当 blocker。
+- `mesh_task_claim` 在未 ready 时拒绝，错误码 `BLOCKED_BY_DEPS`（终局，直到依赖变化）；
+  `mesh_task_adopt` 同样不能绕过依赖。
+- 创建时全图校验（照官方 `task-graph.ts`）：缺失 → `TASK_NOT_FOUND`、重复 → `INVALID_FIELD`、
+  自依赖/成环 → `TASK_DEPENDENCY_CYCLE`。
+- `mesh_task_create` / `list` / `claim` 返回带 `ready` 与 `blockedBy`；`ready` 是**派生值**
+  （`open && 依赖全 done`），不落冗余状态列。
+
+### 新增：写入范围 `writeScopes`（`mesh_task_create`）
+
+- 可选 `writeScopes: string[]`（workspace 相对路径前缀）。归一化照官方 `validation.ts` 的
+  `writeScope`；非法值报 `INVALID_WRITE_SCOPE`。
+- 与进行中任务（`working`/`claimed`）写域重叠时返回 `writeScopeWarnings`
+  （字段名与官方 `types.ts` 一致），**只警告不阻止** —— 写域是协作提示，不是锁。
+
+### 新增：乐观并发 `expectedRevision`（claim / complete / cancel / report / adopt）
+
+- 可选整数；与当前 `revision`（= 老字段 `version`）不一致 → `REVISION_CONFLICT`（**可重试**），
+  detail 带 `expected_revision` / `current_revision` / `retryable: true`，任务不被改动。
+- 不给该参数时行为与 0.6.1 逐字节一致（维持既有检查）。
+- 注意：revision 包含心跳/派发回执等写操作（每次 +1），`expectedRevision` 适合"读一次马上写"；
+  跨心跳的长流程请省略。本插件没有 `mesh_task_update` 工具，依赖只能在创建时定死。
+
+### 新增：错误码分类（终局 vs 可重试）
+
+- `src/domain.js` 新增 `ERROR_CATALOG` / `describeErrorCode()` / `isRetryableError()`；
+  HTTP 错误体新增 `retryable` 与 `hint`。**老码一个不改名**，只加官方语义别名：
+  `TASK_CLOSED`→`TASK_TERMINAL`、`ALREADY_CLAIMED`→`LEASE_HELD`、
+  `REVISION_CONFLICT`→`TEAM_TASK_STALE_REVISION`、`TASK_DEPENDENCY_CYCLE`→`TEAM_TASK_DEPENDENCY_CYCLE`。
+  README 有完整「哪些可重试」表。
+
+### 新增：noWait 禁等待守卫（默认只作用于 mesh worker）
+
+- `src/noWait.js`（新文件）：用宿主真实 API `ctx.tools.guard()`（app.asar 内 dsh-tools 已核）；
+  拦三类：bash/pwsh 命令含 `sleep`、前台 `timeoutMs > 30000`、`job_output` 有效等待 > 5000ms。
+  拒绝原因是可读的一句话（为什么拦 + 怎么改：后台任务 + 短 `job_output` + heartbeat）。
+- 默认 `noWaitGuard: 'mesh-workers'`：只作用于**正在持有 mesh 任务的会话**（本进程登记表：
+  claim/adopt 记入，complete/cancel 移除），主人自己的长命令不受影响；`'all'` / `'off'` 可改。
+- 宿主没有 `guard()` → 不装守卫、只 WARN，**绝不让插件加载失败**。
+- 已知边界：登记表进程内，跨实例/重启不回收（只影响是否启用守卫，不影响任务语义）。
+
+### 兼容：0.6.1 板服务（能力探测 + 自动降级）
+
+- 客户端启动时读既有 `/health`：优先 `capabilities` 数组，其次 `schema_version >= 5`，否则 legacy。
+- legacy（0.6.1）下：**不发送** `blockedBy` / `writeScopes` / `expectedRevision`；
+  返回按空依赖/空写域处理，`ready` 退化为 `open && 无依赖`；**不做 CAS**（退回既有检查）。
+- `mesh_task_create` / `mesh_task_list` 明确提示「远端板是 0.6.1 旧服务端，这些字段未生效」。
+- 探测失败（health 没有字段）同样按 legacy 处理；**加载绝不因此失败**（0.6.0 事故教训）。
+
+### schema v4 → v5（幂等迁移）
+
+- `task` 表新增 `blocked_by TEXT NOT NULL DEFAULT '[]'`、`write_scopes TEXT NOT NULL DEFAULT '[]'`；
+  按 `PRAGMA table_info` 判缺再 ALTER，可反复执行；老行自动 `'[]'`（无依赖/无写域，与 v4 语义一致）。
+- 未建关联表：依赖/写域判定都基于全量任务视图，一条 `SELECT *` 更简单。
+- 真实数据验证：对**生产共享板**（mcloud，0.6.1 / schema 4）只读拉取 **30 任务 / 177 事件 /
+  27 证据**，物化成 v4 快照后迁移 —— 行数逐表一致、schema 4→5、老行 JSON 默认 `'[]'`、
+  二次打开幂等。另对在用本地 `$DSH_HOME/team/team.db`（实测 0 行）副本验证了机制与幂等；
+  **原件未改**。
+
+### 文档/提示词对齐（纯文案）
+
+- README + 工具 description 写入官方**终态报告五态**（`progress / ready / blocked / failed / dropped`）
+  与**人类注意力规则**（只有人能行动 / 结果可用 / 确定做不了才发消息，默认沉默，"删句测试"）。
+- 写清与官方 Agent Teams 的分工：单机走官方；mesh 只做跨机 + 租约 + 证据门禁 + 唤醒限速。
+
+### 测试与验证
+
+- 全量 **328 / 328 通过**（`node --test test/*.test.mjs`，node v24.19.0）：0.6.1 基线 299 条**一条没删**
+  （其中 5 条 schema 版本断言随 v4→5 更新，见下），新增 **29 条**：
+  `test/v5_task_graph.test.mjs`（15：依赖/写域/CAS/错误码分类/取消 blocker 后不锁板/v5 迁移）、
+  `test/v5_remote_compat.test.mjs`（5：能力探测 / legacy 不发新字段 / 新版发新字段）、
+  `test/no_wait_guard.test.mjs`（9：命中/不命中/开关/别名/登记表/apply 端到端守卫）。
+- 既有断言改动（仅版本号相关，未弱化判定）：`adoption.test.mjs` B10、`v4_lease_identity.test.mjs` A1、
+  `board_hardening.test.mjs` H1、`v4_health_schema.test.mjs` H1/H4/H11 —— 把"schema 必须还是 4"
+  改为"schema 现在应为 5"，并补 v5 列存在性断言；H4 反证目标从 5 改为 6 以保持"非写死"的证明力。
+- 未验证：**未在真实 DSH 宿主里加载 0.7.0**（本任务禁止重启 DSH）；宿主内工具可见性与
+  `ctx.tools.guard()` 的实际拦截效果需重启后确认（guard API 只对着 app.asar 的 dsh-tools 核对过）。
+
+---
+
 ## 0.6.1（2026-11-21）
 
 **行为修复：远端板不可达时默认降级到单机板，不再让整个插件加载失败。**

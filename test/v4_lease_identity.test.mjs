@@ -68,13 +68,17 @@ const OTHER = { pid: process.pid + 4242, start_sec: 1, host: os.hostname() };
 
 // ───────────────────────── A. 租约 pid 防复用 ─────────────────────────
 
-test('A1 迁移：schema 版本到 4，task 多出租约身份三列', () => {
+test('A1 迁移：0.7 起 schema 版本到 5，v4 的租约身份三列仍在', () => {
   const b = newBoard();
-  assert.equal(SCHEMA_VERSION, 4);
+  assert.equal(SCHEMA_VERSION, 5);
   const taskCols = b.db.prepare('PRAGMA table_info(task)').all().map((c) => String(c.name));
   for (const c of ['lease_pid', 'lease_start_sec', 'lease_host']) {
     assert.ok(taskCols.includes(c), `task 表缺列 ${c}`);
   }
+  // v5 新增的依赖/写域两列必须存在，且默认值是 '[]'（老行不丢语义）
+  const row = b.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='task'").get();
+  assert.match(String(row.sql), /blocked_by/, 'task 表应有 blocked_by 列');
+  assert.match(String(row.sql), /write_scopes/, 'task 表应有 write_scopes 列');
   b.close();
 });
 

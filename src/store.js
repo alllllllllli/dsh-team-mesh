@@ -21,6 +21,7 @@ import { randomUUID } from 'node:crypto';
 
 import {
   assertNonEmptyString,
+  assertTaskGraph,
   assertTransition,
   canReclaim,
   decideAdmissibility,
@@ -28,18 +29,23 @@ import {
   DEFAULT_LEASE_MS,
   DEFAULT_SESSION_REQUEST_TTL_MS,
   defaultIsPidAlive,
+  dependentTaskIds,
   evaluateAdoption,
   evaluateCompletion,
   leaseHolderIsDead,
   leaseIdentityMatches,
   leaseIsLive,
+  normalizeWriteScopes,
   OUTCOMES,
   processIdentity,
+  projectTaskView,
+  taskReady,
   TERMINAL,
   TeamError,
+  validateDependencies,
   VERIFICATION_METHODS,
 } from './domain.js';
-import { LocalSqliteBackend, defaultBoardPath } from './backend.js';
+import { LocalSqliteBackend, defaultBoardPath, SCHEMA_VERSION } from './backend.js';
 import { parseRef } from './refs.js';
 
 export { SCHEMA_VERSION, defaultBoardPath, LocalSqliteBackend } from './backend.js';
@@ -141,6 +147,20 @@ export class Board {
     return this.backend.readSchemaVersion();
   }
 
+  /**
+   * 0.7：本板支持哪些新能力。本地板永远全支持（代码与库同版本）；
+   * 远端板由 remote.js 按 /health 探测结果回答（0.6.1 服务端 → legacy）。
+   * 给 UI/诊断用，不参与任务判定。
+   */
+  capabilities() {
+    return {
+      source: 'local',
+      legacy: false,
+      features: ['task-deps', 'write-scopes', 'expected-revision'],
+      schema_version: SCHEMA_VERSION,
+    };
+  }
+
   appendEvent(kind, taskId, actor, payload) {
     return this.backend.insertEvent({
       kind,
@@ -154,19 +174,27 @@ export class Board {
   // ───────────────────────── 任务 ─────────────────────────
 
   createTask(input, actor) {
-    const { title, brief, acceptance, requestId } = input;
+    const { title, requestId } = input;
+    // 老调用方（以及测试）可能不传 brief/acceptance —— 与 validateCreateInput 的缺省口径一致
+    const brief = input.brief ?? '';
+    const acceptance = input.acceptance ?? '';
     // v4：可选门禁开关。老调用方不传 → false → 落库 0 → 门禁行为与 v3 一致。
     const requireIndependentReview = input.requireIndependentReview === true;
     return this.tx(() => {
-      if (requestId !== null) {
+      if (requestId !== null && requestId !== undefined) {
         const prior = this.backend.findTaskByIdempotencyKey(requestId);
         if (prior !== undefined && prior !== null) {
           // 幂等：同一次意图重放，返回原来那条，不新建
-          return { task: this.rowToTask(prior), deduped: true };
+          return { task: this.getTaskView(prior.task_id), deduped: true };
         }
       }
       const now = Date.now();
       const taskId = `t-${crypto.randomUUID().slice(0, 8)}`;
+      // v5：依赖与写域在**写入前**用全量任务校验（缺失/重复/自依赖/成环/绝对路径都不落库）
+      const all = this.readAllTasks();
+      const blockedBy = validateDependencies(input.blockedBy ?? [], all, null);
+      const writeScopes = normalizeWriteScopes(input.writeScopes ?? []);
+      assertTaskGraph(all, { task_id: taskId, blockedBy, writeScopes, lifecycle: 'open' });
       this.backend.insertTask({
         task_id: taskId,
         title,
@@ -178,6 +206,9 @@ export class Board {
         version: 1,
         created_at: now,
         updated_at: now,
+        // v5：老调用方不传 → 空数组（与 v4 行为逐字节一致）
+        blocked_by: blockedBy,
+        write_scopes: writeScopes,
       });
       if (requireIndependentReview) {
         // 建完再单独 CAS 一次，而不是改 insertTask 的列清单：
@@ -188,15 +219,42 @@ export class Board {
         title,
         request_id: requestId,
         require_independent_review: requireIndependentReview ? 1 : 0,
+        // v5：依赖与写域进审计 —— 事后能回答"这条任务当初为什么是阻塞的"
+        blocked_by: blockedBy,
+        write_scopes: writeScopes,
       });
-      const row = this.backend.readTaskRow(taskId);
-      return { task: this.rowToTask(row), deduped: false };
+      return { task: this.getTaskView(taskId), deduped: false };
     });
   }
 
   getTask(taskId) {
     const row = this.backend.readTaskRow(taskId);
     return row === undefined || row === null ? null : this.rowToTask(row);
+  }
+
+  /** 全量任务（rowToTask）。依赖就绪与写域重叠都基于全量判定，不做冗余状态。 */
+  readAllTasks() {
+    if (typeof this.backend.queryAllTasks !== 'function') return [];
+    return this.backend.queryAllTasks().map((row) => this.rowToTask(row));
+  }
+
+  /**
+   * 单任务视图：原始任务字段 + `ready` / `writeScopeWarnings`（照官方 projectTaskView 派生）。
+   * 读全量任务是为了判依赖与重叠；板很小，一次 SELECT * 足够，不做缓存（缓存会过期）。
+   */
+  getTaskView(taskId) {
+    const row = this.backend.readTaskRow(taskId);
+    if (row === undefined || row === null) return null;
+    const task = this.rowToTask(row);
+    const all = this.readAllTasks();
+    // 同一事务里刚写过的行也要算进全量；readAllTasks 已经是最新提交值
+    return { ...task, ...projectTaskView(all, task) };
+  }
+
+  listTaskViews(opts = {}) {
+    const tasks = this.listTasks(opts);
+    const all = this.readAllTasks();
+    return tasks.map((task) => ({ ...task, ...projectTaskView(all, task) }));
   }
 
   listTasks(opts = {}) {
@@ -224,7 +282,8 @@ export class Board {
    * 认领时记下本进程身份，心跳时校验它 —— 这样 PID 被系统复用后不会把租约
    * 悄悄续给一个陌生进程。
    *
-   * @param {{leaseMs?:number, identity?:{pid:number,start_sec:number,host:string|null}}} [opts]
+   * @param {{leaseMs?:number, identity?:{pid:number,start_sec:number,host:string|null},
+   *          expectedRevision?:number}} [opts]
    */
   claimTask(taskId, actor, opts = {}) {
     const leaseMs = Number(opts?.leaseMs ?? DEFAULT_LEASE_MS);
@@ -234,6 +293,8 @@ export class Board {
       const row = this.backend.readTaskRow(taskId);
       if (row === undefined || row === null) throw new TeamError('TASK_NOT_FOUND', `任务不存在：${taskId}`);
       const task = this.rowToTask(row);
+      // 0.7：乐观并发。期望 revision 对不上就**明确拒绝**，绝不"读旧值写新值"。
+      assertExpectedRevision(task, opts?.expectedRevision);
       if (TERMINAL.has(task.lifecycle)) {
         throw new TeamError('TASK_CLOSED', `任务已终结（${task.lifecycle}），不能认领`);
       }
@@ -251,7 +312,23 @@ export class Board {
           stale_at: null,
         });
         this.appendEvent('lease.renewed', taskId, actor, { via: 'claim-dedup', lease_until: now + leaseMs });
-        return { task: this.getTask(taskId), deduped: true };
+        return { task: this.getTaskView(taskId), deduped: true };
+      }
+
+      // 0.7：依赖未全部 done 时**不许认领**（官方 taskReady 口径，错误码区分"被依赖阻塞"）。
+      // 放在"别人持有"判断之前：被依赖阻塞是更根本的拒绝理由（等多久都不会变好，除非依赖完成）。
+      const all = this.readAllTasks();
+      if (!taskReady(all, task)) {
+        const pending = (task.blockedBy ?? []).map((id) => {
+          const blocker = all.find((candidate) => candidate.task_id === id);
+          return `${id}（${blocker === undefined ? '不存在' : blocker.lifecycle}）`;
+        });
+        throw new TeamError(
+          'BLOCKED_BY_DEPS',
+          `任务 ${taskId} 还不能认领：依赖未全部 completed —— ${pending.join('、')}。` +
+            '依赖完成后（done）再 claim；在此之前重试同样的调用不会成功。',
+          { blockedBy: task.blockedBy ?? [], blockers: pending },
+        );
       }
 
       // 别人持有：只有在租约失效 / stale 时才允许接管
@@ -275,8 +352,22 @@ export class Board {
         });
       }
 
-      assertTransition(task.lifecycle, 'claimed');
-      assertTransition('claimed', 'working');
+      try {
+        assertTransition(task.lifecycle, 'claimed');
+        assertTransition('claimed', 'working');
+      } catch (err) {
+        // 0.7：把"当前状态不可认领"归到稳定码 TASK_NOT_READY（终局，状态变化前重试无意义），
+        // 不把 INVALID_TRANSITION 这种内部码直接抛给模型 —— 两者对调用方是同一件事。
+        if (err instanceof TeamError && err.code === 'INVALID_TRANSITION') {
+          throw new TeamError(
+            'TASK_NOT_READY',
+            `任务 ${taskId} 当前状态是 ${task.lifecycle}，不能认领（只有 open 任务可直接认领；` +
+              'claimed/working 的任务只有在租约过期或 stale 后才允许接管）。',
+            { lifecycle: task.lifecycle },
+          );
+        }
+        throw err;
+      }
       const ok = this.backend.updateTaskCas(taskId, task.version, {
         lifecycle: 'working',
         owner_session: actor,
@@ -294,7 +385,7 @@ export class Board {
         lease_until: now + leaseMs,
         lease_ms: leaseMs,
       });
-      return { task: this.getTask(taskId), deduped: false };
+      return { task: this.getTaskView(taskId), deduped: false };
     });
   }
 
@@ -380,6 +471,7 @@ export class Board {
    * @param {(pid:number)=>boolean} [opts.isPidAlive] 注入的存活探测（测试用）
    * @param {boolean} [opts.allowUnverifiedAdoption] 跨机/缺身份时是否放行，默认 false
    * @param {number} [opts.now] 判定时刻（测试用；缺省 Date.now()）
+   * @param {number} [opts.expectedRevision] 0.7 乐观并发；给了就要求等于当前 revision
    * @returns {{task:object, adopted:true, unverified:boolean, verdict:string,
    *            evidence:object, policy:object}}
    */
@@ -398,6 +490,16 @@ export class Board {
       const row = this.backend.readTaskRow(taskId);
       if (row === undefined || row === null) throw new TeamError('TASK_NOT_FOUND', `任务不存在：${taskId}`);
       const task = this.rowToTask(row);
+      assertExpectedRevision(task, opts?.expectedRevision);
+      // 0.7：收养也是"进入进行中"的一条路，同样不许绕过 blockedBy（否则依赖形同虚设）
+      const all = this.readAllTasks();
+      if (!taskReady(all, task)) {
+        throw new TeamError(
+          'BLOCKED_BY_DEPS',
+          `任务 ${taskId} 的依赖未全部 completed，不能收养（依赖未完成时接管等于绕过 blockedBy）。`,
+          { blockedBy: task.blockedBy ?? [] },
+        );
+      }
       const now = Number.isFinite(nowOpt) ? nowOpt : Date.now();
       // 事件按 seq 降序（板/后端的查询都是"新的在前"），domain 里只取第一条租约类事件
       const scanRows = this.backend.queryEvents(ADOPT_EVENT_SCAN_LIMIT, taskId);
@@ -454,7 +556,7 @@ export class Board {
         adopter_identity_reported: identity.pid !== null,
       });
       return {
-        task: this.getTask(taskId),
+        task: this.getTaskView(taskId),
         adopted: true,
         from: task.owner_session,
         unverified: verdict.unverified === true,
@@ -546,7 +648,7 @@ export class Board {
    * @param {object} input 见上；`executed`/`outcome`/`evidenceRef` 是 v3 就有的
    * @param {string} actor 上报人（写进 evidence.actor，门禁判"自验自报"时与 verified_by 比）
    */
-  reportEvidence(taskId, input, actor) {
+  reportEvidence(taskId, input, actor, opts = {}) {
     const executed = input.executed === true;
     const outcome = input.outcome;
     if (!OUTCOMES.includes(outcome)) {
@@ -577,6 +679,8 @@ export class Board {
       const row = this.backend.readTaskRow(taskId);
       if (row === undefined || row === null) throw new TeamError('TASK_NOT_FOUND', `任务不存在：${taskId}`);
       const task = this.rowToTask(row);
+      // 0.7：报证据也支持 CAS —— 防止"看到的是旧任务状态，往一条已被别人改过的任务上补证据"
+      assertExpectedRevision(task, opts?.expectedRevision);
       if (task.lifecycle === 'done' || task.lifecycle === 'canceled') {
         throw new TeamError('TASK_CLOSED', `任务已终结（${task.lifecycle}），不能再报证据`);
       }
@@ -681,12 +785,13 @@ export class Board {
    * 拒绝记录一起抹掉，审计里就永远看不到"谁在何时被门禁拒过"。
    * agent-team 那边已经栽过一次（D-1），这里是从设计上避开，不是一个补丁。
    */
-  completeTask(taskId, actor) {
+  completeTask(taskId, actor, opts = {}) {
     try {
       return this.tx(() => {
         const row = this.backend.readTaskRow(taskId);
         if (row === undefined || row === null) throw new TeamError('TASK_NOT_FOUND', `任务不存在：${taskId}`);
         const task = this.rowToTask(row);
+        assertExpectedRevision(task, opts?.expectedRevision);
         const evidences = this.listEvidence(taskId);
         const gate = evaluateCompletion(task, evidences);
         if (!gate.allowed) {
@@ -696,7 +801,7 @@ export class Board {
         const ok = this.backend.updateTaskCas(taskId, task.version, { lifecycle: 'done' });
         if (!ok) throw new TeamError('CONFLICT', `任务 ${taskId} 在你读之后被改过，请重试`);
         this.appendEvent('task.done', taskId, actor, { evidence_count: evidences.length });
-        return { task: this.getTask(taskId), gate };
+        return { task: this.getTaskView(taskId), gate };
       });
     } catch (err) {
       if (err instanceof TeamError && err.code === 'GATE_REJECTED') {
@@ -715,16 +820,24 @@ export class Board {
     }
   }
 
-  cancelTask(taskId, actor, reason) {
+  cancelTask(taskId, actor, reason, opts = {}) {
     return this.tx(() => {
       const row = this.backend.readTaskRow(taskId);
       if (row === undefined || row === null) throw new TeamError('TASK_NOT_FOUND', `任务不存在：${taskId}`);
       const task = this.rowToTask(row);
+      assertExpectedRevision(task, opts?.expectedRevision);
       assertTransition(task.lifecycle, 'canceled');
+      // 0.7：取消是终局。若还有任务依赖它，依赖方会永远等不到 completed ——
+      // 如实告诉调用方"这会让谁继续被阻塞"，但不阻止（取消是唯一的放弃路径）。
+      const dependents = dependentTaskIds(this.readAllTasks(), taskId);
       const ok = this.backend.updateTaskCas(taskId, task.version, { lifecycle: 'canceled' });
       if (!ok) throw new TeamError('CONFLICT', `任务 ${taskId} 在你读之后被改过，请重试`);
-      this.appendEvent('task.canceled', taskId, actor, { reason: reason ?? '' });
-      return { task: this.getTask(taskId) };
+      this.appendEvent('task.canceled', taskId, actor, {
+        reason: reason ?? '',
+        dependent_count: dependents.length,
+        dependents,
+      });
+      return { task: this.getTaskView(taskId), dependents };
     });
   }
 
@@ -1016,6 +1129,13 @@ export class Board {
         : Number(row.lease_start_sec),
       lease_host: row.lease_host ?? null,
       require_independent_review: Number(row.require_independent_review ?? 0),
+      // v5（0.7）：依赖与写域。老行/缺列读成空数组，语义与 v4 一致。
+      blockedBy: parseIdList(row.blocked_by),
+      writeScopes: parseIdList(row.write_scopes),
+      // 官方字段名叫 revision；本插件老字段叫 version。两个都留着：
+      // - version 是 0.6.1 的既有契约（测试与老脚本在用）
+      // - revision 是 0.7 对齐官方 Agent Teams 的名字（expectedRevision 就是它）
+      revision: Number(row.version),
     };
   }
 }
@@ -1047,11 +1167,63 @@ function resolveIdentity(identity) {
   return identity;
 }
 
+/**
+ * 0.7 乐观并发：调用方若给了 expectedRevision，就要求它等于任务当前 revision（= version）。
+ *
+ * 为什么冲突必须显式报错而不是静默覆盖：两个会话同时改一条任务时，"后写的赢"
+ * 会让先写的那次**无声消失**，而调用方还以为自己的变更生效了。返回稳定码
+ * REVISION_CONFLICT（可重试）并附上当前 revision，调用方重读后就能安全重试。
+ *
+ * 说明：本插件的 revision 是"写版本号"——心跳/续租/派发回执也会 +1。所以
+ * expectedRevision 适合"读一次、马上写"的短窗口；跨心跳的长流程请省略它
+ * （省略即维持 0.6.1 的既有检查，不做 CAS）。
+ *
+ * @param {object} task rowToTask 之后的任务
+ * @param {unknown} expected 调用方给的期望 revision；undefined/null = 不检查
+ */
+export function assertExpectedRevision(task, expected) {
+  if (expected === undefined || expected === null) return;
+  const n = Number(expected);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new TeamError('INVALID_FIELD', `expectedRevision 必须是正整数，收到：${String(expected)}`);
+  }
+  if (Number(task.version) !== n) {
+    throw new TeamError(
+      'REVISION_CONFLICT',
+      `任务 ${task.task_id} 的 revision 已从 ${n} 变为 ${task.version}（在你读之后有人改过它，可能是心跳/认领/完成）。` +
+        '这是**可重试**冲突：重新读取任务拿到最新 revision，再按最新状态重试。',
+      {
+        retryable: true,
+        expected_revision: n,
+        current_revision: Number(task.version),
+        // 给脚本/面板一个机器可读的"可重试"标记，不必去查 README
+        error_class: 'retryable',
+      },
+    );
+  }
+}
+
 function safeParse(text) {
   try {
     return JSON.parse(text);
   } catch {
     return { _raw: String(text) };
+  }
+}
+
+/**
+ * 解析一个 JSON 字符串数组列（blocked_by / write_scopes）。
+ * 库里的值可能是 NULL（列刚加、老行）或被人手工改坏的文本 ——
+ * 一律退化成空数组：**派生视图不能因为一列坏数据把整块板读崩**。
+ */
+function parseIdList(raw) {
+  if (raw === null || raw === undefined) return [];
+  if (Array.isArray(raw)) return raw.map((v) => String(v));
+  try {
+    const parsed = JSON.parse(String(raw));
+    return Array.isArray(parsed) ? parsed.map((v) => String(v)) : [];
+  } catch {
+    return [];
   }
 }
 

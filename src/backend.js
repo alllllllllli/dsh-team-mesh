@@ -22,7 +22,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { eventPayload } from './domain.js';
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /**
  * blob 默认保留期：7 天。
@@ -237,6 +237,21 @@ const EVIDENCE_V4_COLUMNS = [
   ['acceptance_ref', 'TEXT'],
   ['verification_method', 'TEXT'],
 ];
+/**
+ * v5 给 task 表追加的列 —— **任务依赖 + 写域**（0.7.0，对齐官方 Agent Teams）。
+ *
+ * 为什么存 JSON 文本而不是建关联表：板上任务量是几十到几百，依赖与写域的读取
+ * 全是"整板视图"（ready / 重叠警告都要全量任务），一条 SELECT * 就够；
+ * 建两张关联表只会多两次 JOIN 和两套迁移，读的却还是全量。
+ * JSON 列的可空 + 默认 '[]' 保证**老数据零影响**：v4 的老行读出来就是空依赖/空写域。
+ *
+ * blocked_by  : JSON 字符串数组（任务 id）。只有全部 done 才算 ready，不落冗余状态。
+ * write_scopes: JSON 字符串数组（workspace 相对路径前缀）。只用于重叠警告，不是锁。
+ */
+const TASK_V5_COLUMNS = [
+  ['blocked_by', "TEXT NOT NULL DEFAULT '[]'"],
+  ['write_scopes', "TEXT NOT NULL DEFAULT '[]'"],
+];
 
 
 export class LocalSqliteBackend {
@@ -256,6 +271,7 @@ export class LocalSqliteBackend {
     this.migrateDispatchV3();
     this.migrateTaskV4();
     this.migrateEvidenceV4();
+    this.migrateTaskV5();
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
     if (row === undefined) {
       this.db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
@@ -316,6 +332,14 @@ export class LocalSqliteBackend {
   /** v4 迁移：evidence 表补结构化复核列。幂等，老行一律 NULL。 */
   migrateEvidenceV4() {
     return this.addColumnsIfMissing('evidence', EVIDENCE_V4_COLUMNS);
+  }
+
+  /**
+   * v5 迁移：task 表补 blocked_by / write_scopes 两列。**幂等**（每次开库都跑，
+   * 已存在就是空操作），老行由列默认值 '[]' 得到"无依赖、无写域"——与 v4 语义一致。
+   */
+  migrateTaskV5() {
+    return this.addColumnsIfMissing('task', TASK_V5_COLUMNS);
   }
 
   /**
@@ -390,8 +414,8 @@ export class LocalSqliteBackend {
     this.db
       .prepare(
         `INSERT INTO task(task_id, title, brief, acceptance, lifecycle, created_by, request_id,
-           version, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+           version, created_at, updated_at, blocked_by, write_scopes)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         row.task_id,
@@ -404,11 +428,22 @@ export class LocalSqliteBackend {
         row.version,
         row.created_at,
         row.updated_at,
+        // v5：依赖与写域以 JSON 文本落库；缺省 '[]'（老调用方不传即空）
+        JSON.stringify(row.blocked_by ?? []),
+        JSON.stringify(row.write_scopes ?? []),
       );
   }
 
   readTaskRow(taskId) {
     return this.db.prepare('SELECT * FROM task WHERE task_id = ?').get(taskId);
+  }
+
+  /**
+   * 全量任务行（按创建时间升序）。**依赖判定 / 写域重叠都看全量**，
+   * 而 tasks 数量级很小（几十~几百），一次 SELECT * 比一堆 JOIN 更简单也更快。
+   */
+  queryAllTasks() {
+    return this.db.prepare('SELECT * FROM task ORDER BY created_at ASC, task_id ASC').all();
   }
 
   queryTasks(where, args, limit) {

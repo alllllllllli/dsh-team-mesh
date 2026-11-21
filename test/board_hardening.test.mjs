@@ -663,7 +663,7 @@ test('H1 默认监听地址仍是 127.0.0.1（行为不变），/health 报真�
   assert.equal(body.listen_host_configured, '127.0.0.1');
   assert.equal(body.listen_exposed, false);
   assert.ok(typeof body.listen_hint === 'string' && body.listen_hint.includes('回环'), `提示应说明是回环：${body.listen_hint}`);
-  assert.equal(body.schema_version, 4, 'schema_version 必须仍是 4（本次没有任何 schema 变更）');
+  assert.equal(body.schema_version, 5, '0.7 起 schema_version 为 5（新增任务依赖/写域两列）');
   // 新观测段都在且默认启用
   assert.equal(body.gc.enabled, true);
   assert.equal(body.gc.retention_ms, DEFAULT_BLOB_RETENTION_MS);

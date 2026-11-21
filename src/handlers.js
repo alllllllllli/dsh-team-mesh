@@ -277,6 +277,50 @@ function fmtEvidenceLines(evidences) {
   });
 }
 
+/**
+ * 0.7：任务元信息（依赖 / 写域 / ready / revision）的公共渲染。
+ * 只在这些字段存在时输出 —— 旧板（0.6.1 远端或老任务）的输出与 0.6.1 一字不差。
+ */
+function fmtTaskMetaLines(task) {
+  const lines = [];
+  if (task.revision !== undefined && task.revision !== null) {
+    lines.push(`  revision：${task.revision}（写操作可带 expectedRevision）`);
+  }
+  const blockedBy = Array.isArray(task.blockedBy) ? task.blockedBy : [];
+  if (blockedBy.length > 0) {
+    lines.push(
+      `  依赖 blockedBy：${blockedBy.join(', ')}` +
+        (task.ready === true ? '（已全部 completed → ready）' : '（还有未完成的依赖 → 不 ready，不能 claim）'),
+    );
+  }
+  const scopes = Array.isArray(task.writeScopes) ? task.writeScopes : [];
+  if (scopes.length > 0) lines.push(`  写域 writeScopes：${scopes.join(', ')}`);
+  for (const warning of Array.isArray(task.writeScopeWarnings) ? task.writeScopeWarnings : []) {
+    lines.push(`  ⚠ ${warning}（只警告，不阻塞）`);
+  }
+  return lines;
+}
+
+/**
+ * 0.7：当前板支持哪些新能力。远端 0.6.1 服务端没升级时，新字段**不发送也不返回**；
+ * 这里如实告诉调用方，避免它以为 blockedBy/expectedRevision 已经生效。
+ */
+function boardCapabilities(board) {
+  try {
+    return typeof board?.capabilities === 'function' ? board.capabilities() : null;
+  } catch {
+    return null;
+  }
+}
+
+function fmtLegacyCapabilityNote(caps, fields) {
+  if (caps === null || caps === undefined || caps.legacy !== true) return [];
+  return [
+    `  ⚠ 远端板是 0.6.1 旧服务端（schema ${caps.schema_version ?? '?'}）：` +
+      `${fields.join(' / ')} 未发送也未生效；升级板服务并重启后才会启用。`,
+  ];
+}
+
 /** 收养的三类证据：分开显示，**不许合并成一句"通过"**。 */
 function fmtAdoptionEvidence(ev) {
   const evidence = ev ?? {};
@@ -340,6 +384,26 @@ function adoptionRejectHint(code) {
 
 export function createHandlers(deps) {
   const { getBoard, getInterconnect } = deps;
+
+  /**
+   * 0.7：mesh worker 登记表（可选依赖）。装了 noWait 守卫时，它决定"哪些会话算正在持有任务"。
+   * 不传 → null：所有登记动作变成空操作，守卫也就永远不启用 —— 与 0.6.1 行为一字不差。
+   */
+  const workers = deps.workers ?? null;
+  const markWorker = (actor, taskId) => {
+    try {
+      workers?.mark?.(actor, taskId);
+    } catch {
+      /* 登记失败不影响任务语义 */
+    }
+  };
+  const releaseWorker = (actor, taskId) => {
+    try {
+      workers?.release?.(actor, taskId);
+    } catch {
+      /* ignore */
+    }
+  };
 
   /**
    * 0.6.1：当前板模式（可选依赖）。不传 → null，诊断输出与 0.6.0 一字不差。
@@ -535,7 +599,9 @@ export function createHandlers(deps) {
     async mesh_task_create(args, exec) {
       const input = validateCreateInput(args ?? {});
       const actor = sessionIdOf(exec);
-      const { task, deduped } = await getBoard().createTask(input, actor);
+      const board = getBoard();
+      const caps = boardCapabilities(board);
+      const { task, deduped } = await board.createTask(input, actor);
       const head = deduped
         ? `这个 requestId 已经建过任务，返回原任务（幂等，没有重复创建）：`
         : `已建任务：`;
@@ -544,20 +610,30 @@ export function createHandlers(deps) {
         `  task_id: ${task.task_id}`,
         `  ${task.title}`,
         `  状态：${lifecycleLabel(task.lifecycle)}`,
+        // 0.7：依赖 / 写域 / revision / ready（老任务为空数组时不输出这两行）
+        ...fmtTaskMetaLines(task),
+        `  ready：${task.ready === true ? '是（可以 claim）' : '否（等依赖完成 / 等认领条件满足）'}`,
         ...(task.require_independent_review === 1
           ? ['  独立复核：已开启（完成时须有一条 verifiedBy ≠ 上报人的可采信证据）']
           : []),
+        ...fmtLegacyCapabilityNote(caps, ['blockedBy', 'writeScopes']),
         '',
         '下一步：mesh_dispatch 派给别人，或自己 mesh_task_claim 后再动手。',
       ].join('\n');
     },
 
     async mesh_task_list(args) {
-      const tasks = await getBoard().listTasks({
+      const board = getBoard();
+      const caps = boardCapabilities(board);
+      const query = {
         lifecycle: args?.lifecycle,
         ownerSession: args?.ownerSession,
         limit: args?.limit,
-      });
+      };
+      // 0.7：本地/新版远端板给派生视图（ready / writeScopeWarnings）；旧板退回原始列表
+      const tasks = typeof board.listTaskViews === 'function'
+        ? await board.listTaskViews(query)
+        : await board.listTasks(query);
       if (tasks.length === 0) return '共享任务板上没有符合条件的任务。';
       const lines = [`共 ${tasks.length} 条（按最近更新排序）：`];
       for (const t of tasks) {
@@ -567,8 +643,19 @@ export function createHandlers(deps) {
         if (t.stale === 1) flags.push('STALE(负责人失联)');
         if (t.ack_state === 'timeout') flags.push('ACK_TIMEOUT(送到了没人管)');
         else if (t.ack_state === 'pending') flags.push('待回执');
+        // 0.7：依赖/写域状态也进列表 —— 一眼看出"为什么不能认领""和谁写域撞了"
+        const blockedBy = Array.isArray(t.blockedBy) ? t.blockedBy : [];
+        if (blockedBy.length > 0 && t.ready !== true) flags.push(`BLOCKED_BY_DEPS(${blockedBy.join(',')})`);
+        if (t.ready === true && t.lifecycle === 'open' && blockedBy.length > 0) flags.push('READY(依赖已完成)');
+        const warnings = Array.isArray(t.writeScopeWarnings) ? t.writeScopeWarnings : [];
+        if (warnings.length > 0) flags.push(`WRITE_SCOPE_WARN(${warnings.length})`);
         const flagText = flags.length > 0 ? `  ⚠ ${flags.join(' / ')}` : '';
-        lines.push(`  ${t.task_id}  ${lifecycleLabel(t.lifecycle)}${owner}  ${t.title}${flagText}`);
+        const rev = t.revision === undefined ? '' : `  rev=${t.revision}`;
+        lines.push(`  ${t.task_id}  ${lifecycleLabel(t.lifecycle)}${owner}${rev}  ${t.title}${flagText}`);
+        for (const warning of warnings) lines.push(`    ⚠ ${warning}（只警告，不阻塞）`);
+      }
+      if (caps !== null && caps.legacy === true) {
+        lines.push(...fmtLegacyCapabilityNote(caps, ['blockedBy', 'writeScopes']));
       }
       return lines.join('\n');
     },
@@ -578,7 +665,12 @@ export function createHandlers(deps) {
       const actor = sessionIdOf(exec);
       // 总管永不执行任务（硬要求）：认领直接拒，错误码固定，别让它变成"租约被占"的模糊失败
       assertNotDispatcher(actor);
-      const { task, deduped } = await getBoard().claimTask(taskId, actor, { leaseMs: args?.leaseMs });
+      const { task, deduped } = await getBoard().claimTask(taskId, actor, {
+        leaseMs: args?.leaseMs,
+        expectedRevision: args?.expectedRevision,
+      });
+      // 0.7：只有在真的持有任务时才登记（守卫只认这个）
+      markWorker(actor, taskId);
       const lease = task.lease_until === null
         ? ''
         : `\n  租约至：${fmtTime(task.lease_until)}（到期前请用 mesh_task_heartbeat 续租，建议 ≤5 分钟一次）`;
@@ -588,6 +680,7 @@ export function createHandlers(deps) {
             `已认领：${task.task_id}`,
             `  状态：${lifecycleLabel(task.lifecycle)}`,
             `  负责人：${task.owner_session}${lease}`,
+            ...fmtTaskMetaLines(task),
           ].join('\n');
     },
 
@@ -614,6 +707,7 @@ export function createHandlers(deps) {
         res = await getBoard().adoptTask(taskId, actor, {
           leaseMs: args?.leaseMs,
           allowUnverifiedAdoption: allowUnverifiedAdoption(),
+          expectedRevision: args?.expectedRevision,
         });
       } catch (err) {
         // 收养被拒是**可预期的正常结果**（不是工具坏了）：把三类证据原样摊开给调用方。
@@ -639,10 +733,12 @@ export function createHandlers(deps) {
       const leaseText = res.task.lease_until === null
         ? ''
         : `\n  租约至：${fmtTime(res.task.lease_until)}（到期前请 mesh_task_heartbeat 续租）`;
+      markWorker(actor, taskId);
       const lines = [
         `${res.unverified ? '已收养（⚠ 未验证）' : '已收养（三证据核验通过）'}：${res.task.task_id}`,
         `  原负责人：${res.from ?? '未知'} → 现在是你（${res.task.owner_session}）`,
         `  状态：${lifecycleLabel(res.task.lifecycle)}${leaseText}`,
+        ...fmtTaskMetaLines(res.task),
         '  三证据：',
         ...fmtAdoptionEvidence(res.evidence),
         '',
@@ -722,6 +818,8 @@ export function createHandlers(deps) {
           verificationMethod: args?.verificationMethod,
         },
         actor,
+        // 0.7：可选乐观并发（不传 = 0.6.1 行为）
+        { expectedRevision: args?.expectedRevision },
       );
       const lines = [
         `已记录证据 #${res.evidence_id}（task ${taskId}）`,
@@ -764,8 +862,12 @@ export function createHandlers(deps) {
       const actor = sessionIdOf(exec);
       const board = getBoard();
       try {
-        const { task } = await board.completeTask(taskId, actor);
-        return [`任务已完成：${task.task_id}`, `  ${task.title}`, `  状态：${lifecycleLabel(task.lifecycle)}`].join('\n');
+        const { task } = await board.completeTask(taskId, actor, {
+          expectedRevision: args?.expectedRevision,
+        });
+        // 0.7：任务已终态 —— 从"持有 mesh 任务"登记表里删掉（noWait 守卫不再拦它）
+        releaseWorker(actor, taskId);
+        return [`任务已完成：${task.task_id}`, `  ${task.title}`, `  状态：${lifecycleLabel(task.lifecycle)}`, ...fmtTaskMetaLines(task)].join('\n');
       } catch (err) {
         if (err instanceof TeamError && err.code === 'GATE_REJECTED') {
           const reasons = Array.isArray(err.detail) ? err.detail : [err.message];
@@ -791,8 +893,19 @@ export function createHandlers(deps) {
     async mesh_task_cancel(args, exec) {
       const taskId = requireTaskId(args);
       const actor = sessionIdOf(exec);
-      const { task } = await getBoard().cancelTask(taskId, actor, args?.reason ?? '');
-      return [`已取消：${task.task_id}`, `  状态：${lifecycleLabel(task.lifecycle)}（终态，不可恢复）`].join('\n');
+      const { task, dependents } = await getBoard().cancelTask(taskId, actor, args?.reason ?? '', {
+        expectedRevision: args?.expectedRevision,
+      });
+      releaseWorker(actor, taskId);
+      const lines = [`已取消：${task.task_id}`, `  状态：${lifecycleLabel(task.lifecycle)}（终态，不可恢复）`];
+      // 0.7：取消不算完成。依赖它的任务会继续被阻塞 —— 如实说，别让调用方以为连带清掉了
+      if (Array.isArray(dependents) && dependents.length > 0) {
+        lines.push(
+          `  ⚠ 仍有任务依赖它：${dependents.join(', ')}`,
+          '  这些任务会**继续被阻塞**（依赖只认 done，取消不算完成）。清理办法：给它们换成已完成的任务，或一并取消。',
+        );
+      }
+      return lines.join('\n');
     },
 
     async mesh_dispatch(args, exec) {

@@ -26,6 +26,69 @@ import { blobRef, isBlobRef, parseRef } from './refs.js';
 const DEFAULT_TIMEOUT_MS = 10000;
 
 /**
+ * 0.7 能力探测：客户端**必须先问板服务支持什么**，再决定发不发新字段。
+ *
+ * 硬要求来自 0.6.0 的事故：远端板是不可控的外部依赖，mcloud 上的板服务可能还是
+ * 0.6.1（schema 4）。新客户端若直接把 blockedBy/writeScopes/expectedRevision
+ * 塞进请求，老服务端要么忽略（静默失真）、要么报错（跨机派活全挂）。
+ * 所以规则是：**探测不到就不发**，本地按"空依赖 / 空写域 / 不做 CAS"降级。
+ *
+ * 判据优先级：
+ *   1. /health 显式 capabilities 数组（0.7+ 板服务）；
+ *   2. schema_version >= 5（0.7 的库 schema，间接说明服务端代码够新）；
+ *   3. 都没有 → legacy（0.6.1 及更早）。
+ */
+const CAP_ALL = Object.freeze(['task-deps', 'write-scopes', 'expected-revision']);
+const CAP_SCHEMA_FEATURE_FLOOR = 5;
+
+/**
+ * 解析 /health 的响应，得到能力集合。
+ * @param {object|null} healthBody
+ * @returns {{features:Set<string>, legacy:boolean, schema_version:number|null, source:string}}
+ */
+export function parseCapabilities(healthBody) {
+  const body = healthBody !== null && typeof healthBody === 'object' ? healthBody : {};
+  const schemaVersion = Number.isInteger(Number(body.schema_version)) ? Number(body.schema_version) : null;
+  if (Array.isArray(body.capabilities)) {
+    return {
+      features: new Set(body.capabilities.map((v) => String(v))),
+      legacy: false,
+      schema_version: schemaVersion,
+      source: 'capabilities',
+    };
+  }
+  if (schemaVersion !== null && schemaVersion >= CAP_SCHEMA_FEATURE_FLOOR) {
+    // 0.7 服务端未显式声明能力时，按 schema 版本推断（同一版本代码里三项都有）
+    return { features: new Set(CAP_ALL), legacy: false, schema_version: schemaVersion, source: 'schema_version' };
+  }
+  return { features: new Set(), legacy: true, schema_version: schemaVersion, source: 'legacy' };
+}
+
+/**
+ * 把远端返回的任务规整成"总带 derived 字段"的形状。
+ * 老服务端（0.6.1）不返回 ready/writeScopeWarnings/blockedBy/writeScopes ——
+ * **不编造**：依赖与写域给空数组；ready 退化为"open 且无依赖"（对它而言这是真值）。
+ * @param {object|null} task
+ * @returns {object|null}
+ */
+export function normalizeRemoteTask(task) {
+  if (task === null || task === undefined || typeof task !== 'object') return task;
+  const blockedBy = Array.isArray(task.blockedBy) ? task.blockedBy : [];
+  const writeScopes = Array.isArray(task.writeScopes) ? task.writeScopes : [];
+  return {
+    ...task,
+    blockedBy,
+    writeScopes,
+    ready: task.ready === undefined
+      ? task.lifecycle === 'open' && blockedBy.length === 0
+      : task.ready === true,
+    writeScopeWarnings: Array.isArray(task.writeScopeWarnings) ? task.writeScopeWarnings : [],
+    revision: task.revision === undefined ? task.version : task.revision,
+  };
+}
+
+
+/**
  * v4：本进程的租约身份 —— **调用方进程**的 pid / 进程启动秒 / 主机名。
  *
  * 方向必须搞清楚：RemoteBoard 跑在**调用方机器**上，所以这里要报的是调用方的身份。
@@ -105,10 +168,37 @@ export class RemoteBoard {
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.dbPath = null; // 远端没有本地库文件
     this.isRemote = true;
+    // 0.7：能力探测结果。health() 之前一律按 legacy 处理（保守：不发送新字段）。
+    this.healthInfo = null;
+    this.parsedCapabilities = null;
   }
 
   close() {
     /* 无长连接可关；保留方法是为了与 Board 的接口一致 */
+  }
+
+  /** 0.7：当前板服务是否支持某个新能力（探不到 → false）。 */
+  supports(feature) {
+    return this.parsedCapabilities !== null && this.parsedCapabilities.features.has(feature);
+  }
+
+  /**
+   * 0.7：给 handlers 的诚实诊断。legacy=true 表示对端是 0.6.1 旧服务端，
+   * blockedBy / writeScopes / expectedRevision 都不会发送，也没有派生字段可返回。
+   */
+  capabilities() {
+    const parsed = this.parsedCapabilities ?? {
+      features: new Set(),
+      legacy: true,
+      schema_version: null,
+      source: 'unknown',
+    };
+    return {
+      source: parsed.source,
+      legacy: parsed.legacy,
+      features: [...parsed.features],
+      schema_version: parsed.schema_version,
+    };
   }
 
   url(p, query) {
@@ -172,22 +262,25 @@ export class RemoteBoard {
   // ───────────────────────── 任务 ─────────────────────────
 
   async createTask(input, actor) {
-    const r = await this.call('POST', '/task/create', {
-      body: {
-        title: input.title,
-        brief: input.brief,
-        acceptance: input.acceptance,
-        requestId: input.requestId,
-        actor,
-      },
-    });
-    return { task: r.task, deduped: r.deduped === true };
+    const body = {
+      title: input.title,
+      brief: input.brief,
+      acceptance: input.acceptance,
+      requestId: input.requestId,
+      actor,
+    };
+    // 0.7：只在探测到新能力时才发送新字段 —— 老服务端收不到就不会误读/报错
+    if (this.supports('task-deps')) body.blockedBy = input.blockedBy ?? [];
+    if (this.supports('write-scopes')) body.writeScopes = input.writeScopes ?? [];
+    if (input.requireIndependentReview === true) body.requireIndependentReview = true;
+    const r = await this.call('POST', '/task/create', { body });
+    return { task: normalizeRemoteTask(r.task), deduped: r.deduped === true };
   }
 
   async getTask(taskId) {
     try {
       const r = await this.call('GET', '/task/get', { query: { taskId } });
-      return r.task;
+      return normalizeRemoteTask(r.task);
     } catch (err) {
       if (err instanceof TeamError && err.code === 'TASK_NOT_FOUND') return null;
       throw err;
@@ -198,20 +291,32 @@ export class RemoteBoard {
     const r = await this.call('GET', '/task/list', {
       query: { lifecycle: opts.lifecycle, ownerSession: opts.ownerSession, limit: opts.limit },
     });
-    return r.tasks;
+    return (r.tasks ?? []).map((task) => normalizeRemoteTask(task));
+  }
+
+  /** 与本地 Board 同名：handler 用同一套调用拿派生视图（远端交给服务端派生）。 */
+  async listTaskViews(opts = {}) {
+    return this.listTasks(opts);
+  }
+
+  async getTaskView(taskId) {
+    return this.getTask(taskId);
   }
 
   async claimTask(taskId, actor, opts = {}) {
-    const r = await this.call('POST', '/task/claim', {
-      body: {
-        taskId,
-        actor,
-        leaseMs: opts?.leaseMs,
-        // v4：让板服务记下**本进程**（调用方）的身份，而不是它自己的 pid。
-        leaseIdentity: this.leaseIdentity(),
-      },
-    });
-    return { task: r.task, deduped: r.deduped === true };
+    const body = {
+      taskId,
+      actor,
+      leaseMs: opts?.leaseMs,
+      // v4：让板服务记下**本进程**（调用方）的身份，而不是它自己的 pid。
+      leaseIdentity: this.leaseIdentity(),
+    };
+    // 0.7：老服务端不认识 expectedRevision —— 不发；此时就是 0.6.1 的既有检查
+    if (this.supports('expected-revision') && opts?.expectedRevision !== undefined) {
+      body.expectedRevision = opts.expectedRevision;
+    }
+    const r = await this.call('POST', '/task/claim', { body });
+    return { task: normalizeRemoteTask(r.task), deduped: r.deduped === true };
   }
 
   /**
@@ -253,7 +358,7 @@ export class RemoteBoard {
    * 报证据。若引用是本机路径，**先上传再改写为 blob 引用** —— 这是跨机闭环的核心。
    * 模型仍然只给一个本机路径，不需要知道 blob 协议存在。
    */
-  async reportEvidence(taskId, input, actor) {
+  async reportEvidence(taskId, input, actor, opts = {}) {
     let evidenceRef = input.evidenceRef;
     let upload = null;
     if (typeof evidenceRef === 'string' && evidenceRef.trim().length > 0) {
@@ -265,16 +370,19 @@ export class RemoteBoard {
       // 已存在的本机路径 → 上传；不存在的路径保持原样，让服务端判"不存在"并拒绝。
       // 这一步是刻意的：不能因为"上传失败"就把一条不存在的证据变成合格证据。
     }
-    const r = await this.call('POST', '/task/report', {
-      body: {
-        taskId,
-        executed: input.executed,
-        outcome: input.outcome,
-        note: input.note,
-        evidenceRef,
-        actor,
-      },
-    });
+    const body = {
+      taskId,
+      executed: input.executed,
+      outcome: input.outcome,
+      note: input.note,
+      evidenceRef,
+      actor,
+    };
+    // 0.7：老服务端没有 expectedRevision —— 不发（退回既有检查）
+    if (this.supports('expected-revision') && opts?.expectedRevision !== undefined) {
+      body.expectedRevision = opts.expectedRevision;
+    }
+    const r = await this.call('POST', '/task/report', { body });
     r.uploaded = upload;
     return r;
   }
@@ -284,14 +392,22 @@ export class RemoteBoard {
     return r.evidence;
   }
 
-  async completeTask(taskId, actor) {
-    const r = await this.call('POST', '/task/complete', { body: { taskId, actor } });
-    return { task: r.task, gate: r.gate };
+  async completeTask(taskId, actor, opts = {}) {
+    const body = { taskId, actor };
+    if (this.supports('expected-revision') && opts?.expectedRevision !== undefined) {
+      body.expectedRevision = opts.expectedRevision;
+    }
+    const r = await this.call('POST', '/task/complete', { body });
+    return { task: normalizeRemoteTask(r.task), gate: r.gate };
   }
 
-  async cancelTask(taskId, actor, reason) {
-    const r = await this.call('POST', '/task/cancel', { body: { taskId, actor, reason } });
-    return { task: r.task };
+  async cancelTask(taskId, actor, reason, opts = {}) {
+    const body = { taskId, actor, reason };
+    if (this.supports('expected-revision') && opts?.expectedRevision !== undefined) {
+      body.expectedRevision = opts.expectedRevision;
+    }
+    const r = await this.call('POST', '/task/cancel', { body });
+    return { task: normalizeRemoteTask(r.task), dependents: r.dependents ?? [] };
   }
 
   async recordDispatch(taskId, peerInstance, peerSession, result, opts = {}) {
@@ -379,17 +495,19 @@ export class RemoteBoard {
    * call() 会把它变成带 code 与 detail 的 TeamError，detail 里就是三类证据原文。
    */
   async adoptTask(taskId, actor, opts = {}) {
-    const r = await this.call('POST', '/task/adopt', {
-      body: {
-        taskId,
-        actor,
-        leaseMs: opts?.leaseMs,
-        // 收养后新租约的**持有者**是调用方；身份仍按 v4 的规矩由调用方上报。
-        leaseIdentity: this.leaseIdentity(),
-      },
-    });
+    const body = {
+      taskId,
+      actor,
+      leaseMs: opts?.leaseMs,
+      // 收养后新租约的**持有者**是调用方；身份仍按 v4 的规矩由调用方上报。
+      leaseIdentity: this.leaseIdentity(),
+    };
+    if (this.supports('expected-revision') && opts?.expectedRevision !== undefined) {
+      body.expectedRevision = opts.expectedRevision;
+    }
+    const r = await this.call('POST', '/task/adopt', { body });
     return {
-      task: r.task,
+      task: normalizeRemoteTask(r.task),
       adopted: r.adopted === true,
       from: r.from ?? null,
       unverified: r.unverified === true,
@@ -447,7 +565,11 @@ export class RemoteBoard {
     if (res.status !== 200) {
       throw new TeamError('BOARD_UNHEALTHY', `板服务 /health 返回 HTTP ${res.status}`);
     }
-    return JSON.parse(res.body.toString('utf8'));
+    const body = JSON.parse(res.body.toString('utf8'));
+    // 0.7：能力探测就发生在这一步。探测失败不影响"能连上"这个结论 —— 退化为 legacy。
+    this.healthInfo = body;
+    this.parsedCapabilities = parseCapabilities(body);
+    return body;
   }
 }
 

@@ -68,6 +68,158 @@
 - `boardFallback` 只认 `local` / `fail` 两个值；写错（如 `locall`）按 `local` 处理并打一条 WARN
   —— 配置笔误不该把插件打挂，但也不能静默当对。
 
+## 0.7.0：任务依赖 / 写域 / 乐观并发 / noWait 守卫
+
+0.7.0 把 mesh 任务板**对齐官方 Agent Teams 的任务语义**（官方源码 `task-view.ts` / `task-graph.ts`，
+MIT），并补了一个跨机派活特有的坑：子会话用长 `sleep` 把租约和发起方的等待一起拖长。
+工具总数仍是 **14**（没有新增工具，只给既有工具加可选参数与文案）。schema 从 **4 升到 5**。
+
+### 1) 任务依赖 `blockedBy`（`mesh_task_create`）
+
+- `blockedBy: string[]`：任务 id 数组。**只有全部为 `done` 才 ready**；未 ready 时 `mesh_task_claim`
+  拒绝并返回 `BLOCKED_BY_DEPS`；`mesh_task_adopt` 同样不能绕过依赖。
+- 就绪判定照官方 `taskReady`：只认 `completed`（本插件 = `done`）。**`canceled` 不算完成** ——
+  取消是终局，永远等不到 completed；引用了已取消任务的任务会一直阻塞（所以创建时就拒绝
+  让已取消任务当 blocker）。
+- 创建时校验：blocker 必须存在、不能重复、不能自依赖、不能成环（全图 DFS，与官方
+  `assertTaskGraphCandidate` 同一套判据）。错误码：缺失 → `TASK_NOT_FOUND`、
+  重复 → `INVALID_FIELD`、环/自依赖 → `TASK_DEPENDENCY_CYCLE`。
+- `mesh_task_list` / `mesh_task_create` / `mesh_task_claim` 的返回带 `ready` 与 `blockedBy`；
+  `ready` 是**派生值**（`open && 依赖全 done`），不落冗余状态列。
+
+### 2) 写入范围 `writeScopes`（`mesh_task_create`）
+
+- `writeScopes: string[]`：workspace 相对路径前缀（如 `src/parser`、`docs`）。归一化照官方
+  `writeScope`：反斜杠转 `/`、去 `./` 与尾部 `/`；拒绝空串、绝对路径、盘符、含 `..` 的路径
+  （错误码 `INVALID_WRITE_SCOPE`）。
+- 与**进行中**任务（`working`/`claimed`）写域重叠时，任务视图返回
+  `writeScopeWarnings`（`write scopes overlap with <task id>`，字段名与官方 `types.ts` 一致）。
+  **只警告、不阻止**认领或写入 —— 写域是协作提示，不是锁。
+
+### 3) 乐观并发 `expectedRevision`（claim / complete / cancel / report / adopt）
+
+- 可选整数参数。与当前 `revision` 不一致 → `REVISION_CONFLICT`（**可重试**），
+  返回 detail 里带 `expected_revision` / `current_revision` / `retryable: true`；
+  任务**不会被改动**，绝不"读旧写新"式静默覆盖。
+- `revision` 与老字段 `version` 同值（都来自 `task.version`），任务快照两个名字都给，
+  方便老脚本与官方语义（`expectedRevision`）两边都能用。
+- **注意**：本插件的 revision 是"写版本号"——**心跳/续租/派发回执也会 +1**。
+  所以 `expectedRevision` 适合"读一次、马上写"的短窗口；跨心跳的长流程请省略它
+  （省略 = 维持 0.6.1 的既有检查，不做 CAS）。
+- 本插件**没有** `mesh_task_update` 工具（官方有 `team_task_update` 的 set_dependencies 等动作）；
+  0.7 的依赖在创建时定死，没有"后改依赖"的入口（见下方已知限制）。
+
+### 4) 错误码分类：哪些可重试，哪些是终局
+
+机器可读分类在 `src/domain.js` 的 `ERROR_CATALOG`（`describeErrorCode()` / `isRetryableError()`），
+HTTP 错误体也会带 `retryable` 与 `hint`。命名**不改老码**，只加别名：
+
+| 类别 | 错误码（别名） | 可重试？ |
+| --- | --- | --- |
+| 任务不存在 | `TASK_NOT_FOUND` | ❌ 终局 |
+| 任务已终结 | `TASK_CLOSED`（`TASK_TERMINAL`） | ❌ 终局 |
+| 参数非法 | `INVALID_FIELD` / `INVALID_INPUT` / `INVALID_OUTCOME` / `INVALID_TRANSITION` / `INVALID_WRITE_SCOPE` | ❌ 终局 |
+| 依赖成环 | `TASK_DEPENDENCY_CYCLE`（`TEAM_TASK_DEPENDENCY_CYCLE`） | ❌ 终局 |
+| 被依赖阻塞 | `BLOCKED_BY_DEPS` | ❌ 终局**直到依赖变化**（依赖完成后可再 claim） |
+| 状态不就绪 | `TASK_NOT_READY` | ❌ 终局（状态变化前重试无意义） |
+| 版本冲突 | `REVISION_CONFLICT`（`TEAM_TASK_STALE_REVISION`）、`CONFLICT` | ✅ **可重试**：重读拿最新 revision |
+| 租约被占 | `ALREADY_CLAIMED`（`LEASE_HELD`） | ✅ 可重试（前提：等租约过期/stale；在租期内重试无意义） |
+| 门禁拒绝 | `GATE_REJECTED` | ❌ 终局（先补可采信证据） |
+| 网络/限流 | `BOARD_UNREACHABLE` / `TIMEOUT` / `RATE_LIMITED` | ✅ 可重试 |
+
+### 5) noWait 禁等待守卫（默认只作用于 mesh worker）
+
+- 新建 `src/noWait.js`，用宿主真实 API `ctx.tools.guard()`（`app.asar` 的 dsh-tools 已确认存在；
+  guard 在 pre-execute policy 之后对每次工具调用执行，返回字符串即拒绝）。
+- 拦截三类：
+  1. `bash` / `pwsh` 命令里出现 `sleep`（含 `Start-Sleep`）；
+  2. **前台**命令 `timeoutMs > 30000`（`run_in_background: true` 不管）；
+  3. `job_output` 的有效等待 > 5000ms（`wait: true` 且 `timeout_ms` 未传时按宿主默认 30s 算，也会被拦）。
+- 拒绝原因写给模型看：为什么拦 + 怎么改（后台任务 + `job_output timeout_ms ≤ 5000` + heartbeat）。
+- **默认只作用于"正在持有 mesh 任务的会话"**（本进程内登记表：claim/adopt 成功记入，
+  complete/cancel 移除），主人自己的长命令不受影响。配置：
+
+```yaml
+- id: dsh-team-mesh
+  config:
+    noWaitGuard: 'mesh-workers'   # 默认；只拦持有 mesh 任务的会话
+    # noWaitGuard: 'all'          # 全局拦（慎用）
+    # noWaitGuard: 'off'          # 完全关闭
+    # applyTo: 'mesh-workers'     # 同义别名（与 noWaitGuard 二选一即可）
+```
+
+- 宿主没有 `ctx.tools.guard()`（老版本宿主）→ **不装守卫、只 WARN**，绝不让插件装载失败。
+- 已知边界：登记表在进程内，别的实例认领/收养不会回收到本进程；插件重启后为空
+  （等价于"暂时不拦"，是安全方向）。
+
+### 6) 与 0.6.1 板服务的协议兼容（硬要求）
+
+生产共享板在 mcloud，跑的是 **0.6.1 服务端（schema 4）**，本次**不升级它**。
+0.7 客户端启动时用既有 `/health` 做能力探测：
+
+- 优先读 `/health.capabilities`（0.7+ 板服务新增的数组）；
+- 没有就看 `schema_version >= 5`；
+- 都没有 → **legacy 0.6.1**。
+
+legacy 下自动降级，且**绝不因为新字段导致加载失败**：
+
+| 能力 | legacy 服务端上的行为 |
+| --- | --- |
+| `blockedBy` / `writeScopes` | **不发送**；返回按空数组处理，`ready` 退化为 `open && 无依赖`（对老板而言是真值） |
+| `expectedRevision` | **不发送**；退回 0.6.1 的既有检查（不做 CAS） |
+| 派生字段 | 服务端没有 `ready/writeScopeWarnings` 时客户端补安全默认值，不编造结论 |
+| 提示 | `mesh_task_create` / `mesh_task_list` 输出里明确写「远端板是 0.6.1 旧服务端，这些字段未生效」 |
+
+本地板与 0.7+ 板服务（`capabilities` 或 schema ≥5）→ 三项全开。
+升级板服务只需重启板服务进程，不需要改客户端（探测自动生效）；**客户端插件重启后才用新代码**。
+
+### 7) schema v4 → v5 迁移（幂等）
+
+- `task` 表新增 `blocked_by TEXT NOT NULL DEFAULT '[]'` 与 `write_scopes TEXT NOT NULL DEFAULT '[]'`。
+  每次都按 `PRAGMA table_info` 判缺再 `ALTER TABLE`，可反复执行（幂等）；老行自动得到 `'[]'`，
+  语义与 v4 一致（无依赖、无写域）。
+- 没有建关联表：依赖/写域判定都需要"全量任务视图"，一条 `SELECT *` 比两套 JOIN + 迁移更简单。
+- 用真实数据副本验证过：从**生产共享板（0.6.1, schema 4）只读拉取 30 条真实任务 / 177 条事件 /
+  27 条证据**，物化成 v4 快照后跑迁移 —— 行数逐表一致、schema 4→5、老行依赖/写域为 `[]`、
+  二次打开幂等。本机 `$DSH_HOME/team/team.db` 实测为 0 行（生产 DSH 连远端板，本地库只在降级时写），
+  也照样验证了迁移机制与幂等。
+
+### 8) 终态报告五态 + 人类注意力规则（文案对齐官方）
+
+工具 description 与本节使用官方 Agent Teams 的同一套口径（官方 `prompts/work.md`、
+`prompts/team/communication.md`，MIT）：
+
+- **progress**：还在做、内部进展 —— 继续干活 + `mesh_task_heartbeat`；不 complete、不发消息。
+- **ready**：自检通过 + 证据齐 —— 先 `mesh_task_report(pass + evidenceRef)`，再 `mesh_task_complete`。
+- **blocked**：被**必须由人**解决的事挡住 —— report 里写清缺什么、人现在能做什么。
+- **failed**：试过且确定做不了 —— `report(fail, note=原因)` + `mesh_task_cancel(reason)`。
+- **dropped**：查无此事 / 无需动作 —— `cancel(reason="dropped: …")`，不发消息。
+
+**人类注意力规则（默认沉默）**：只有「人能行动 / 结果可用 / 确定做不了」才值得打扰人；
+内部进展、未完成草稿、待跑的检查都不发。发之前做"删句测试"：删掉这句，人还能理解结果或行动吗？
+
+### 9) 与 DSH 官方 Agent Teams 的分工（别用错层）
+
+| 场景 | 用什么 |
+| --- | --- |
+| 单机、同一进程树内的多代理协作（spawn teammate / 任务板 / Web 面板 / 依赖 / 写域 / CAS） | **官方 Agent Teams**（DSH 0.2.2 起内置） |
+| 跨进程 / 跨机器共享任务板 | mesh（本插件） |
+| 租约 + 心跳 + 三证据接管（判定"负责人是不是真死了"） | mesh |
+| 证据门禁（物证哈希由代码实算，不接受模型自报） | mesh |
+| 回执窗口 / ack_timeout / 入站唤醒限速 | mesh |
+
+mesh 的 0.7 任务语义是**向官方对齐**（字段名 `blockedBy` / `writeScopes` / `expectedRevision` /
+`ready` / `writeScopeWarnings` 与官方 `types.ts` 一致），单机场景没有必要拆成两个板。
+
+### 0.7 的已知限制（不隐瞒）
+
+1. 依赖只能在**创建时**设定；没有 `set_dependencies` / 后改依赖的工具（工具总数保持 14）。
+2. 依赖被 `cancel` 后，依赖方仍被阻塞（只认 `done`）；取消时返回会列出受影响的依赖方。
+3. `revision` 包含心跳/派发回执等写操作，`expectedRevision` 跨心跳会冲突（可重试，重读即可）。
+4. 远端 legacy（0.6.1）板上三项新能力**不可用**（有意为之：比"发了新字段把老服务端打挂"安全）。
+5. `noWaitGuard` 的 worker 登记表在进程内；跨实例/重启不回收（只影响是否启用守卫，不影响任务语义）。
+6. 本次**未在真实 DSH 宿主里加载 0.7.0**（未重启 DSH），宿主内行为需重启后确认。
+
 ## 为什么可行（单机的关键前提）
 
 同一台机器上所有 DSH 实例共享 `DSH_HOME`。于是：

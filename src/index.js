@@ -27,6 +27,7 @@ import { DEFAULT_DISPATCHER_POLL_MS, normalizeDispatcherSessions, startDispatche
 import { createHandlers } from './handlers.js';
 import { installInboxHook } from './inboxHook.js';
 import { createDispatchRegistry, DEFAULT_REDISPATCH_POLL_MS, startLifecycle } from './lifecycle.js';
+import { createWorkerRegistry, installNoWaitGuard, normalizeNoWaitMode } from './noWait.js';
 import { RemoteBoard } from './remote.js';
 import { allSpecs, TOOL_NAMES } from './spec.js';
 import { defaultBoardPath, openBoard } from './store.js';
@@ -48,7 +49,7 @@ export const name = 'dsh-team-mesh';
  */
 export const inject = ['tools', 'interconnect'];
 
-export const PLUGIN_VERSION = '0.6.1';
+export const PLUGIN_VERSION = '0.7.0';
 
 async function loadDefineTool() {
   try {
@@ -514,6 +515,33 @@ async function registerAll(ctx, config, disposers) {
   // stale 自动重派与完成通知都从它取候选（详见 lifecycle.js 顶部的已知边界）。
   const dispatchRegistry = createDispatchRegistry();
 
+  // 0.7：mesh worker 登记表 + noWait 禁等待守卫。
+  // 只登记"本进程认领/收养成功的会话"—— guard 必须是同步的，远端板查询是异步的，
+  // 所以用进程内登记（重启清空 = 守卫暂时不拦，安全方向）。
+  const workerRegistry = createWorkerRegistry();
+  // 配置键：主名 noWaitGuard；同时接受 applyTo（任务书里的叫法）作为同义别名。
+  const noWaitRaw = config.noWaitGuard !== undefined ? config.noWaitGuard : config.applyTo;
+  const noWaitMode = normalizeNoWaitMode(noWaitRaw, ctx);
+  if (noWaitMode !== 'off') {
+    try {
+      disposers.push(
+        installNoWaitGuard({
+          ctx,
+          mode: noWaitMode,
+          isMeshWorker: (sessionId) => workerRegistry.has(sessionId),
+          logger: ctx?.logger,
+        }),
+      );
+    } catch (err) {
+      // 守卫装不上只影响"防长等待"，绝不能拖垮整插件 —— 与收件箱/总管同一口径
+      try {
+        ctx?.logger?.warn?.(`[dsh-team-mesh] noWait 守卫未安装：${err?.message ?? err}`);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   const handlers = createHandlers({
     getBoard: () => board,
     // 0.6.1：板模式（远端 / 本地 / 本地降级）给诊断工具用；只读，不参与任何判定
@@ -528,6 +556,8 @@ async function registerAll(ctx, config, disposers) {
     allowUnverifiedAdoption: config.allowUnverifiedAdoption === true,
     // 0.5：派发成功后登记，给 stale 自动重派 / 完成通知用
     dispatchRegistry,
+    // 0.7：mesh worker 登记表（noWait 守卫用它判断"这个会话是否正在持有任务"）
+    workers: workerRegistry,
     // 0.6：入站唤醒限速（四道闸）。默认全关 —— 与 0.5 完全一致（不读表、不落事件）。
     wakeConfig: {
       wakeGuard: config.wakeGuard === true,
@@ -721,7 +751,11 @@ async function registerAll(ctx, config, disposers) {
       : boardMode.mode === 'local-degraded'
         ? `本地降级 ${board.dbPath}（远端 ${endpoint} 不可达，原因：${boardMode.reason}）`
         : board.dbPath;
-    ctx?.logger?.info?.(`[dsh-team-mesh] ${PLUGIN_VERSION} 已加载：${tools.length} 个工具，板=${boardLabel}`);
+    const caps = typeof board?.capabilities === 'function' ? board.capabilities() : null;
+    const capsLabel = caps === null ? '' : `，板能力=${caps.legacy === true ? 'legacy(0.6.1)' : caps.features.join('/')}`;
+    ctx?.logger?.info?.(
+      `[dsh-team-mesh] ${PLUGIN_VERSION} 已加载：${tools.length} 个工具，板=${boardLabel}${capsLabel}，noWait=${noWaitMode}`,
+    );
   } catch {
     /* 日志不可用不影响注册 */
   }

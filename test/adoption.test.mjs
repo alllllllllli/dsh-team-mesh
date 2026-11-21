@@ -554,13 +554,16 @@ test('B9 同一个进程自己持有租约时不许"收养"自己的任务 → A
   );
 });
 
-test('B10 收养不破坏 schema：仍是 v4，没有新增租约列', () => {
+test('B10 收养不破坏 schema：0.7 起为 v5（v4 租约列原样保留，只新增依赖/写域列）', () => {
   const b = newBoard();
-  assert.equal(SCHEMA_VERSION, 4);
-  assert.equal(b.schemaVersion().version, 4);
+  assert.equal(SCHEMA_VERSION, 5);
+  assert.equal(b.schemaVersion().version, 5);
   const cols = b.db.prepare('PRAGMA table_info(task)').all().map((c) => String(c.name));
   const leaseCols = cols.filter((c) => c.startsWith('lease_')).sort();
   assert.deepEqual(leaseCols, ['lease_host', 'lease_owner', 'lease_pid', 'lease_start_sec', 'lease_until']);
+  // v5 的两列是 0.7 任务依赖/写域用的；收养本身仍然只复用已有列，没有 adopted_by 之类的新列
+  assert.ok(cols.includes('blocked_by'), 'v5 应有 blocked_by 列');
+  assert.ok(cols.includes('write_scopes'), 'v5 应有 write_scopes 列');
   assert.equal(cols.includes('adopted_by'), false, '收养只复用已有列，不许加列');
 });
 

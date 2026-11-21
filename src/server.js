@@ -25,7 +25,7 @@ import http from 'node:http';
 import path from 'node:path';
 
 import { DEFAULT_BLOB_RETENTION_MS } from './backend.js';
-import { TeamError } from './domain.js';
+import { describeErrorCode, TeamError } from './domain.js';
 import { Board } from './store.js';
 
 export const BOARD_SERVICE_VERSION = '1.0.0';
@@ -76,6 +76,11 @@ function sendErr(res, err) {
       : err.code === 'CONFLICT' ? 409
       : err.code === 'ALREADY_CLAIMED' ? 409
       : err.code === 'TASK_CLOSED' ? 409
+      // 0.7：乐观并发 / 依赖阻塞 / 状态不就绪都是"当前状态不允许"，用 409；
+      // REVISION_CONFLICT 与 CONFLICT 属**可重试**（客户端重读后重来），其余依赖/终局是终局态。
+      : err.code === 'REVISION_CONFLICT' ? 409
+      : err.code === 'BLOCKED_BY_DEPS' ? 409
+      : err.code === 'TASK_NOT_READY' ? 409
       // 0.4：收养拒绝都是"当前状态/证据不允许这次接管"，语义上是冲突而不是参数错
       : typeof err.code === 'string' && err.code.startsWith('ADOPT_') ? 409
       : err.code === 'RATE_LIMITED' ? 429
@@ -87,9 +92,17 @@ function sendErr(res, err) {
       const retryMs = Number(err.detail?.retry_after_ms);
       if (Number.isFinite(retryMs)) extraHeaders['retry-after'] = String(Math.max(1, Math.ceil(retryMs / 1000)));
     }
+    const classified = describeErrorCode(err.code);
     return sendJson(res, status, {
       ok: false,
-      error: { code: err.code, message: err.message, detail: err.detail ?? null },
+      error: {
+        code: err.code,
+        message: err.message,
+        detail: err.detail ?? null,
+        // 0.7：把"可不可重试"直接告诉客户端/脚本，别让它去猜 HTTP 码或翻 README
+        retryable: classified.retryable,
+        hint: classified.hint,
+      },
     }, extraHeaders);
   }
   return sendJson(res, 500, {
@@ -455,6 +468,9 @@ function makeRoutes(board, cfg = {}) {
         adoption: {
           allow_unverified: cfg.allowUnverifiedAdoption === true,
         },
+        // 0.7：能力清单 —— 客户端据此决定发不发 blockedBy/writeScopes/expectedRevision。
+        // 老客户端不认识这个字段（多一个键不影响它）；新客户端见到它就不用去猜 schema 版本。
+        capabilities: ['task-deps', 'write-scopes', 'expected-revision'],
       };
     },
 
@@ -467,6 +483,9 @@ function makeRoutes(board, cfg = {}) {
           requestId: body.requestId ?? null,
           // v4：可选，缺省 false（老调用方不传 → 行为不变）
           requireIndependentReview: body.requireIndependentReview === true,
+          // 0.7：可选任务依赖 / 写域（老客户端不传 → 空数组 → 行为与 0.6.1 一致）
+          blockedBy: body.blockedBy ?? [],
+          writeScopes: body.writeScopes ?? [],
         },
         body.actor ?? 'unknown',
       );
@@ -474,14 +493,15 @@ function makeRoutes(board, cfg = {}) {
     },
 
     'GET /task/get': (_ctx, params) => {
-      const task = board.getTask(params.taskId);
+      // 0.7：返回派生视图（ready / writeScopeWarnings），不额外落库
+      const task = board.getTaskView(params.taskId);
       if (task === null) throw new TeamError('TASK_NOT_FOUND', `任务不存在：${params.taskId}`);
       return { ok: true, task };
     },
 
     'GET /task/list': (_ctx, params) => ({
       ok: true,
-      tasks: board.listTasks({
+      tasks: board.listTaskViews({
         lifecycle: params.lifecycle,
         ownerSession: params.ownerSession,
         limit: params.limit,
@@ -496,6 +516,8 @@ function makeRoutes(board, cfg = {}) {
         // 客户端没报（当前 remote.js 就是这样，本次冻结不动它）→ null = 不知道，
         // 板服务如实记 NULL，所有校验跳过，行为与 v3 完全一致。
         identity: readIdentity(body),
+        // 0.7：乐观并发（老客户端不传 → undefined → 不做 CAS）
+        expectedRevision: body.expectedRevision,
       });
       return { ok: true, ...res };
     },
@@ -513,6 +535,8 @@ function makeRoutes(board, cfg = {}) {
         leaseMs: body.leaseMs,
         identity: readIdentity(body),
         allowUnverifiedAdoption: cfg.allowUnverifiedAdoption === true,
+        // 0.7：乐观并发（老客户端不传 → undefined）
+        expectedRevision: body.expectedRevision,
       });
       return { ok: true, ...res };
     },
@@ -532,6 +556,8 @@ function makeRoutes(board, cfg = {}) {
           verificationMethod: body.verificationMethod,
         },
         body.actor ?? 'unknown',
+        // 0.7：乐观并发（老客户端不传 → 不检查）
+        { expectedRevision: body.expectedRevision },
       );
       return { ok: true, ...res };
     },
@@ -552,12 +578,16 @@ function makeRoutes(board, cfg = {}) {
     }),
 
     'POST /task/complete': (_ctx, _p, body) => {
-      const res = board.completeTask(body.taskId, body.actor ?? 'unknown');
+      const res = board.completeTask(body.taskId, body.actor ?? 'unknown', {
+        expectedRevision: body.expectedRevision,
+      });
       return { ok: true, ...res };
     },
 
     'POST /task/cancel': (_ctx, _p, body) => {
-      const res = board.cancelTask(body.taskId, body.actor ?? 'unknown', body.reason ?? '');
+      const res = board.cancelTask(body.taskId, body.actor ?? 'unknown', body.reason ?? '', {
+        expectedRevision: body.expectedRevision,
+      });
       return { ok: true, ...res };
     },
 

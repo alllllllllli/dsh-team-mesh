@@ -50,6 +50,41 @@ const textOut = {
   render: (_args, value) => [{ type: 'text', text: String(value ?? '') }],
 };
 
+/**
+ * 0.7：终态报告五态 —— **与官方 Agent Teams 的 orchestrator_report 同一套语义**
+ * （来源：官方提示词 `prompts/work.md` 44-49 行，MIT）。放在 spec 里是为了让
+ * "模型看的契约"与 README 同源：改了这五个词，两边一起改。
+ *
+ * 为什么 mesh 需要它：跨机派活最贵的错误不是"做错了"，而是"用一条含糊的进展消息
+ * 打断了另一个人"。五态把"内部进展"与"需要人处理"分开，消息才有判据。
+ */
+const FIVE_STATES_NOTE = [
+  '**终态报告五态（与官方 Agent Teams 一致）**：',
+  '  progress：还在做，内部进展 —— 继续干活、用 mesh_task_heartbeat 声明活着；不必为此调 complete，也不要打扰人；',
+  '  ready：自检通过且证据齐 —— 先 mesh_task_report(pass + evidenceRef)，再 mesh_task_complete（门禁会再判一次）；',
+  '  blocked：被**必须由人**解决的事挡住 —— report 里写清具体缺什么、人现在能做什么；',
+  '  failed：试过了、确定做不了 —— report(fail, note=原因) 并 mesh_task_cancel(reason)；',
+  '  dropped：查无此事 / 无需动作 —— mesh_task_cancel(reason="dropped: …")，不发消息。',
+];
+
+/**
+ * 0.7：人类注意力规则（官方 `prompts/team/communication.md` 的"默认沉默"口径）。
+ * 这是给所有会发消息/会完结任务的工具共用的一段，避免各工具文案各说一套。
+ */
+const ATTENTION_NOTE = [
+  '**人类注意力规则（默认沉默）**：只有三种情况才值得打扰人 —— 人能行动、结果可用、确定做不了；',
+  '内部进展、未完成草稿、待跑的检查都不发消息。发之前做"删句测试"：删掉这句，人还能理解结果或采取行动吗？',
+];
+
+/**
+ * 0.7：mesh 与官方 Agent Teams 的分工（写进工具描述，模型才不会用错层）。
+ */
+const DIVISION_NOTE = [
+  '**与 DSH 官方 Agent Teams 的分工**：单机、同一进程树内的多代理协作**直接用官方 Agent Teams**',
+  '（它有任务板、认领、依赖与 Web 面板）；mesh 只补官方没有的那层 —— **跨进程/跨机器**共享板、',
+  '租约与心跳、三证据接管、证据门禁、回执与入站唤醒限速。不要把本机单机任务也搬到这里。',
+];
+
 export function peersSpec() {
   return {
     name: TOOL_NAMES.peers,
@@ -68,6 +103,8 @@ export function peersSpec() {
       '0.6.1 起输出**首行给出板模式**：`远端` / `本地` / `本地降级（原因…）`。',
       '看到「本地降级」说明远端共享板连不上、已自动退回本机板 —— 此时跨机任务不会同步，',
       '网络恢复后重启 DSH 才会切回远端。',
+      '',
+      ...DIVISION_NOTE,
     ].join('\n'),
     parameters: {
       includeSessions: {
@@ -112,14 +149,38 @@ export function createSpec() {
       '在本机共享任务板上新建一个团队任务。任务对**本机所有 DSH 实例**可见',
       '（板是一份共享 SQLite 文件），但不会自动派给任何人——派发用 mesh_dispatch。',
       '',
+      ...DIVISION_NOTE,
+      '',
+      '0.7 起支持两种可选的任务元信息：',
+      '  blockedBy：任务依赖（任务 id 数组）。依赖未全部 completed 时任务不 ready、不能 claim；',
+      '             依赖缺失 / 重复 / 自依赖 / 成环 / 引用已取消任务都会被拒。',
+      '  writeScopes：工作区相对路径前缀（如 src/parser）。与其他进行中任务写域重叠时**只告警不阻止**，',
+      '             列表/查询里会返回 writeScopeWarnings。',
+      '',
       'requestId 是幂等键：同一次意图重放（比如网络抖动后重试）不会建出两个任务。',
       '创建只是"登记意图"，不是"完成"；完成必须走 mesh_task_report + mesh_task_complete。',
+      '',
+      ...FIVE_STATES_NOTE,
     ].join('\n'),
     parameters: {
       title: { type: 'string', required: true, description: '一句话任务标题（≤200 字）' },
       brief: { type: 'string', description: '背景与要求，写清楚对方需要知道的东西（≤4000 字）' },
       acceptance: { type: 'string', description: '验收标准：怎样算做完（≤4000 字）' },
       requestId: { type: 'string', description: '幂等键；同一意图重复提交时填同一个值' },
+      blockedBy: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          '任务依赖（可选）：这些任务 id 必须全部 completed（done）后本任务才 ready、才能 claim。'
+          + '不能自依赖、不能成环、不能引用已取消任务；依赖变化前 claim 会返回 BLOCKED_BY_DEPS。',
+      },
+      writeScopes: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          '写入范围（可选）：workspace 相对路径前缀数组（如 ["src/parser", "docs"]）。'
+          + '与其他进行中任务重叠时只在返回里给 writeScopeWarnings 警告，**不阻止**认领/写入。',
+      },
       requireIndependentReview: {
         type: 'boolean',
         description:
@@ -162,12 +223,22 @@ export function claimSpec() {
       '',
       '已被别人认领、租约仍有效、或已终结的任务会被拒绝 —— 拒绝原因会原样返回，不要绕过去。',
       '原负责人租约已过期/stale 时，你可以接管（会在审计里记 lease.taken_over）。',
+      '',
+      '0.7 起：任务还有未完成的 blockedBy 依赖时**不能认领**，返回 `BLOCKED_BY_DEPS`（终局，直到依赖变化）。',
+      '可选 expectedRevision：给一个正整数，与任务当前 revision 不一致就返回 `REVISION_CONFLICT`（**可重试**：',
+      '重读任务拿最新 revision 再试）。不给则维持 0.6.1 的既有检查（不做 CAS）。',
     ].join('\n'),
     parameters: {
       taskId: { type: 'string', required: true, description: '任务 id，形如 t-1a2b3c4d' },
       leaseMs: {
         type: 'integer',
         description: '租约时长（毫秒，默认 600000 = 10 分钟）',
+      },
+      expectedRevision: {
+        type: 'integer',
+        description:
+          '可选乐观并发：任务当前 revision（网格里也叫 version）。不一致返回 REVISION_CONFLICT（可重试）。'
+          + '注意心跳/派发回执也会让 revision +1，跨心跳的长流程请省略本参数。',
       },
     },
     output: textOut,
@@ -213,6 +284,10 @@ export function adoptSpec() {
         type: 'integer',
         description: '给新持有者的租约时长（毫秒，默认 600000 = 10 分钟）',
       },
+      expectedRevision: {
+        type: 'integer',
+        description: '可选乐观并发：任务当前 revision。不一致返回 REVISION_CONFLICT（可重试）。',
+      },
     },
     output: textOut,
   };
@@ -231,6 +306,10 @@ export function reportSpec() {
       '              哈希与大小由本插件对磁盘实算，模型自报的哈希一律不采信。',
       '',
       '是否"可采信"由插件按上述事实算出来，不由你声明。',
+      '',
+      ...FIVE_STATES_NOTE,
+      '',
+      ...ATTENTION_NOTE,
     ].join('\n'),
     parameters: {
       taskId: { type: 'string', required: true, description: '任务 id' },
@@ -259,6 +338,12 @@ export function reportSpec() {
         type: 'string',
         description: '怎么验的（可选）：disk-hash / manual-review / test-run 三者之一',
       },
+      expectedRevision: {
+        type: 'integer',
+        description:
+          '可选乐观并发：任务当前 revision。不一致返回 REVISION_CONFLICT（可重试）；'
+          + '注意心跳会让 revision +1。',
+      },
     },
     output: textOut,
   };
@@ -273,9 +358,19 @@ export function completeSpec() {
       '会被拒绝的情况（原因会具体返回）：没有任何证据；证据全部不可采信；',
       '最后一条可采信证据是 fail 或 unknown；任务没被认领；任务已终结。',
       '被拒之后请补证据（mesh_task_report）再试，不要换个说法重试同样的调用。',
+      '',
+      '只有「ready」才该调它：自检通过且证据齐。还在做（progress）就别调 ——',
+      '内部进展不需要打扰任何人。',
+      '',
+      '可选 expectedRevision：与任务当前 revision 不一致返回 `REVISION_CONFLICT`（**可重试**）。',
+      '注意心跳会让 revision +1；刚发出 heartbeat 又带旧 revision 来 complete 会冲突，重读即可。',
     ].join('\n'),
     parameters: {
       taskId: { type: 'string', required: true, description: '任务 id' },
+      expectedRevision: {
+        type: 'integer',
+        description: '可选乐观并发：任务当前 revision。不一致返回 REVISION_CONFLICT（可重试）。',
+      },
     },
     output: textOut,
   };
@@ -284,10 +379,23 @@ export function completeSpec() {
 export function cancelSpec() {
   return {
     name: TOOL_NAMES.cancel,
-    description: '取消一个任务（终态，不可恢复）。已终结的任务会被拒绝。',
+    description: [
+      '取消一个任务（终态，不可恢复）。已终结的任务会被拒绝。',
+      '',
+      '取消对应官方五态里的两种收尾：',
+      '  failed：试过且确定做不了 —— 先在 mesh_task_report 里写 fail + 原因，再 cancel(reason)；',
+      '  dropped：查无此事 / 无需动作 —— 直接 cancel(reason="dropped: …")，不发消息。',
+      '',
+      '注意：取消**不算完成**。别的任务的 blockedBy 引用它时，那些任务会继续被阻塞（只认 done）；',
+      '返回里会如实列出受影响的依赖方。',
+    ].join('\n'),
     parameters: {
       taskId: { type: 'string', required: true, description: '任务 id' },
-      reason: { type: 'string', description: '取消原因，写进审计' },
+      reason: { type: 'string', description: '取消原因，写进审计（failed / dropped 请注明）' },
+      expectedRevision: {
+        type: 'integer',
+        description: '可选乐观并发：任务当前 revision。不一致返回 REVISION_CONFLICT（可重试）。',
+      },
     },
     output: textOut,
   };
@@ -324,6 +432,9 @@ export function dispatchSpec() {
       'wakeMaxPerThread / wakeNoWake，默认全关）。命中闸门时**不会投递**，返回稳定码',
       'WAKE_TOO_SHORT / WAKE_COOLDOWN / WAKE_LIMIT / WAKE_SILENT，并落审计事件 dispatch.suppressed。',
       '这是配置命中，不是投递失败；按返回里的处理建议改参数或改配置，不要原样重试。',
+      '',
+      '派发之前的提醒：只有「ready（结果可用）/ blocked（人能行动）/ 确定做不了」才值得把任务',
+      '交出去或催人；还在 progress 的内部活不该派发、也不该发消息。',
     ].join('\n'),
     parameters: {
       taskId: { type: 'string', required: true, description: '要派的任务 id' },

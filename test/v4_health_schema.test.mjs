@@ -121,7 +121,7 @@ after(async () => {
 
 // ───────────────────────── 基本契约 ─────────────────────────
 
-test('H1 新板：/health 的 schema_version 等于库里真实值（当前为 4）', async () => {
+test('H1 新板：/health 的 schema_version 等于库里真实值（当前为 5）', async () => {
   const { endpoint, dbPath } = await startService();
   const onDisk = readSchemaVersionOnDisk(dbPath);
   assert.equal(onDisk, String(SCHEMA_VERSION), '新库的 meta.schema_version 应等于 SCHEMA_VERSION');
@@ -130,8 +130,13 @@ test('H1 新板：/health 的 schema_version 等于库里真实值（当前为 4
   assert.equal(status, 200);
   assert.equal(body.ok, true);
   assert.equal(body.schema_version, Number(onDisk));
-  assert.equal(body.schema_version, 4, '当前 schema 版本应为 4（就是任务书里那个真值）');
+  assert.equal(body.schema_version, 5, '0.7 起当前 schema 版本应为 5（新增依赖/写域列）');
   assert.equal(body.schema_version_error, null, '读成功时不该带错误码');
+  // 0.7 能力清单也在 /health 里，客户端据此决定发不发新字段
+  assert.ok(Array.isArray(body.capabilities), '0.7 起 /health 应带 capabilities 数组');
+  for (const cap of ['task-deps', 'write-scopes', 'expected-revision']) {
+    assert.ok(body.capabilities.includes(cap), `capabilities 应包含 ${cap}`);
+  }
 });
 
 test('H2 version 是 HTTP 契约版本，与 schema_version 语义无关，本次不动', async () => {
@@ -157,18 +162,18 @@ test('H3 /health 仍是公开路由（不带密钥也 200），修复没有把�
 
 // ───────────────────── 反证：库变 → 接口跟着变 ─────────────────────
 
-test('H4 反证：库里改成 5 → /health 立刻报 5（证明不是写死 4）', async () => {
+test('H4 反证：库里改成 6 → /health 立刻报 6（证明不是写死 5）', async () => {
   const { endpoint, dbPath } = await startService();
 
-  // 先确认基线是 4，避免"本来就等于 5"这种假通过
-  assert.equal((await getHealth(endpoint)).body.schema_version, 4);
+  // 先确认基线是 5，避免"本来就等于 6"这种假通过
+  assert.equal((await getHealth(endpoint)).body.schema_version, 5);
 
-  setSchemaVersionOnDisk(dbPath, 5);
-  assert.equal(readSchemaVersionOnDisk(dbPath), '5', '磁盘上确实已经是 5');
+  setSchemaVersionOnDisk(dbPath, 6);
+  assert.equal(readSchemaVersionOnDisk(dbPath), '6', '磁盘上确实已经是 6');
 
   const { status, body } = await getHealth(endpoint);
   assert.equal(status, 200);
-  assert.equal(body.schema_version, 5, '库改成 5 后 /health 必须报 5；报 4 说明还是写死的');
+  assert.equal(body.schema_version, 6, '库改成 6 后 /health 必须报 6；报 5 说明还是写死的');
 });
 
 test('H5 反证：连改三次（7 → 2 → 9），每次 /health 都跟随', async () => {
@@ -237,7 +242,7 @@ test('H10 小数 / 带空格的数值：不猜，报 null（不是 4、也不是
 test('H11 分层：Board.schemaVersion() 存在且与库一致（路由不该自己拼 SQL）', async () => {
   const { svc, dbPath } = await startService();
   const res = svc.board.schemaVersion();
-  assert.equal(res.version, 4);
+  assert.equal(res.version, 5);
   assert.equal(res.present, true);
   assert.equal(res.error, null);
   assert.equal(res.raw, readSchemaVersionOnDisk(dbPath));

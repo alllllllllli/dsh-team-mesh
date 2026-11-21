@@ -71,7 +71,17 @@ export function validateCreateInput(input) {
     : assertNonEmptyString(input.requestId, 'requestId', 200);
   // v4：可选「独立复核」门禁，缺省 false（老调用方不传，行为完全不变）
   const requireIndependentReview = input.requireIndependentReview === true;
-  return { title, brief, acceptance, requestId, requireIndependentReview };
+  // 0.7：依赖与写域只做"类型"检查，内容校验在 store（要查全量任务图）。
+  // 缺省空数组 —— 老调用方不传时与 0.6.1 行为逐字节一致。
+  const blockedBy = input.blockedBy === undefined ? [] : input.blockedBy;
+  if (!Array.isArray(blockedBy)) {
+    throw new TeamError('INVALID_INPUT', 'blockedBy 必须是任务 id 数组');
+  }
+  const writeScopes = input.writeScopes === undefined ? [] : input.writeScopes;
+  if (!Array.isArray(writeScopes)) {
+    throw new TeamError('INVALID_INPUT', 'writeScopes 必须是字符串数组');
+  }
+  return { title, brief, acceptance, requestId, requireIndependentReview, blockedBy, writeScopes };
 }
 
 /**
@@ -780,6 +790,279 @@ export function canReclaim(task, now) {
     return { ok: false, why: `仍由 ${task.owner_session} 持有有效租约（至 ${new Date(task.lease_until).toISOString()}）` };
   }
   return { ok: true, why: '租约已到期，允许重新认领' };
+}
+
+// ─────────────── 0.7：任务依赖 / 写域 / 乐观并发（对齐官方 task-view.ts 与 task-graph.ts） ───────────────
+
+/**
+ * 错误码分类表 —— **哪些可重试、哪些是终局**，一张表说完。
+ *
+ * 为什么必须集中：模型（和脚本）只能按 code 分流。同一个"拒绝"如果有时可重试、
+ * 有时不可，而文档里没写，调用方就只能盲目重试或干脆放弃 —— 两种都会把一次
+ * 正常的并发冲突变成一次误判。
+ *
+ * 命名说明（任务允许与官方不同）：官方 `dsh-agent-team` 用 TEAM_TASK_* 前缀；
+ * 本插件沿用既有的 TASK_* / ADOPT_* 码，并在 alias 里给出官方语义等价名，
+ * 方便读过官方源码的人对上号。**既有码一个都不改名**（0.6.1 的调用方不受影响）。
+ *
+ * - retryable=true ：换个时点/重新读一次再做就可能成功（并发冲突、租约被占）。
+ * - retryable=false：同样的输入与状态再试仍然是同样结果（缺参数、终局态、被依赖阻塞）。
+ */
+export const ERROR_CATALOG = Object.freeze({
+  TASK_NOT_FOUND: { retryable: false, hint: '任务不存在或已被删；核对 task_id，不要原样重试' },
+  TASK_CLOSED: { retryable: false, alias: 'TASK_TERMINAL', hint: '任务已终结（done/canceled），不能再改' },
+  TASK_TERMINAL: { retryable: false, hint: '任务已终结（终局态）' },
+  INVALID_FIELD: { retryable: false, hint: '参数不合法，按提示改正再调' },
+  INVALID_INPUT: { retryable: false, hint: '参数不合法' },
+  INVALID_OUTCOME: { retryable: false, hint: 'outcome 必须是 pass / fail / unknown' },
+  INVALID_LIFECYCLE: { retryable: false, hint: '状态值非法' },
+  INVALID_TRANSITION: { retryable: false, hint: '当前状态不允许这一步迁移' },
+  INVALID_WRITE_SCOPE: { retryable: false, alias: 'INVALID_WORKSPACE_RELATIVE_WRITE_SCOPE', hint: 'writeScopes 必须是 workspace 相对路径前缀' },
+  TASK_DEPENDENCY_CYCLE: { retryable: false, alias: 'TEAM_TASK_DEPENDENCY_CYCLE', hint: '依赖成环或自己依赖自己；改依赖关系再建' },
+  REVISION_CONFLICT: { retryable: true, alias: 'TEAM_TASK_STALE_REVISION', hint: 'revision 已变；重新读任务（mesh_task_list/查询）拿到最新 revision 再试' },
+  CONFLICT: { retryable: true, hint: '读与写之间任务被改过；重读后重试' },
+  ALREADY_CLAIMED: { retryable: true, alias: 'LEASE_HELD', hint: '租约仍被别人持有；等过期/stale，或先 cancel，别原地重试' },
+  LEASE_HELD: { retryable: true, hint: '租约仍被别人持有（可重试的前提是租约过期）' },
+  BLOCKED_BY_DEPS: { retryable: false, hint: '依赖未全部 completed；等依赖完成后可再认领（依赖变化前重试无意义）' },
+  TASK_NOT_READY: { retryable: false, hint: '任务当前状态不可认领（非 open / 已在别人名下等）' },
+  GATE_REJECTED: { retryable: false, hint: '完成门禁拒绝；补可采信证据后再试' },
+  NO_PENDING_ACK: { retryable: false, hint: '没有待回执的派发（没派过或已超时）' },
+  NOT_LEASE_OWNER: { retryable: false, hint: '你不是当前负责人，续租无效' },
+  PID_REUSED: { retryable: false, hint: '租约身份对不上（PID 可能被复用）；让原负责人重新 claim' },
+  INTERCONNECT_UNAVAILABLE: { retryable: false, hint: '本实例没有 interconnect 服务' },
+  PEER_NOT_CONFIGURED: { retryable: false, hint: 'peers 里没有这个 instanceId；先改配置' },
+  BOARD_UNREACHABLE: { retryable: true, hint: '板服务连不上；等链路/服务恢复后重试' },
+  TIMEOUT: { retryable: true, hint: '请求超时；确认对端状态后重试' },
+  RATE_LIMITED: { retryable: true, hint: '被板服务限流；按 retry-after 退避' },
+  UNAUTHORIZED: { retryable: false, hint: '密钥不对或没配；改配置' },
+  REMOTE_AUDIT_READONLY: { retryable: false, hint: '远端模式下客户端不能写审计（审计由板服务生成）' },
+});
+
+/**
+ * 查一个错误码的可重试性。未知码按"不可重试"处理（保守：别让调用方盲目重试），
+ * 但 hint 会如实说"未分类"，不假装知道。
+ *
+ * @param {string} code
+ * @returns {{code:string, retryable:boolean, alias:string|null, hint:string}}
+ */
+export function describeErrorCode(code) {
+  const entry = typeof code === 'string' ? ERROR_CATALOG[code] : undefined;
+  if (entry !== undefined) {
+    return {
+      code: String(code),
+      retryable: entry.retryable === true,
+      alias: entry.alias ?? null,
+      hint: entry.hint ?? '',
+    };
+  }
+  if (typeof code === 'string' && code.startsWith('ADOPT_')) {
+    // 收养拒绝码按既有口径：状态/证据不成立，同样的输入重试没有意义
+    return { code, retryable: false, alias: null, hint: '收养被拒绝；按返回的三类证据处理，不要原样重试' };
+  }
+  return { code: String(code ?? 'UNKNOWN'), retryable: false, alias: null, hint: '未分类错误码' };
+}
+
+/** 该错误码是否可重试（供 handler / 面板直接调用）。 */
+export function isRetryableError(code) {
+  return describeErrorCode(code).retryable === true;
+}
+
+/**
+ * 规整一个 workspace 相对路径前缀。**照官方 validation.ts 的 writeScope 搬**：
+ * 反斜杠转正斜杠、去掉 `./` 前缀与尾部斜杠，然后拒绝空串、绝对路径、盘符、
+ * 以及含空段 / `.` / `..` 的路径。写域只用于**警告**，所以归一化必须确定
+ * （`src\a` 与 `src/a/` 必须比出同一个东西），但它不是锁，不阻止任何写入。
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function normalizeWriteScope(value) {
+  if (typeof value !== 'string') {
+    throw new TeamError('INVALID_WRITE_SCOPE', `writeScopes 每一项都必须是字符串，收到：${String(value)}`);
+  }
+  const normalized = value.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  const segments = normalized.split('/');
+  if (
+    normalized.length === 0
+    || normalized.startsWith('/')
+    || /^[a-z]:/i.test(normalized)
+    || segments.some((seg) => seg.length === 0 || seg === '.' || seg === '..')
+  ) {
+    throw new TeamError(
+      'INVALID_WRITE_SCOPE',
+      `writeScopes 必须是 workspace 相对路径前缀（不能是绝对路径 / 盘符 / 含 .. 的路径）：${JSON.stringify(value)}`,
+    );
+  }
+  return normalized;
+}
+
+/** 归一化并去重一组写域。 */
+export function normalizeWriteScopes(values) {
+  return [...new Set(values.map((v) => normalizeWriteScope(v)))];
+}
+
+/**
+ * 两个归一化后的写域是否在路径分量上重叠（互为前缀或完全相同）。
+ * 语义与官方 task-view.ts 的 scopesOverlap 一致：`src/a` 覆盖 `src/a/b`。
+ */
+export function writeScopesOverlap(left, right) {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+/**
+ * 就绪判定 —— **照官方 task-view.ts 的 taskReady**：
+ * 所有 blocker 都 `completed` 才算就绪。官方没有 canceled 状态（删除是 deleted），
+ * 而 `taskReady` 只认 `status === 'completed'`，所以本插件同样**只认 `done`**：
+ * 依赖被 cancel 不算满足（宁可让人显式重建，也不把"取消"当成"做完了"）。
+ *
+ * @param {Array<object>} tasks 全量任务（rowToTask 之后的形状）
+ * @param {object} task 待判任务
+ * @returns {boolean}
+ */
+export function taskReady(tasks, task) {
+  if (task === null || task === undefined || !Array.isArray(task.blockedBy)) return false;
+  return task.blockedBy.every((id) => {
+    const blocker = tasks.find((candidate) => candidate.task_id === id);
+    return blocker !== undefined && blocker.lifecycle === 'done';
+  });
+}
+
+/**
+ * 派生 `ready` 与写域重叠警告 —— **照官方 projectTaskView**，一条状态都不落库。
+ *
+ * 写域重叠只在"别的任务正在进行中"时提示（官方口径：other.status === 'in_progress'；
+ * 本插件对应 claimed / working）。**只警告不阻止**：写域是协作提示，不是锁。
+ *
+ * @param {Array<object>} tasks 全量任务
+ * @param {object} task 待投影任务
+ * @returns {{ready:boolean, writeScopeWarnings:string[]}}
+ */
+export function projectTaskView(tasks, task) {
+  const warnings = new Set();
+  for (const other of tasks) {
+    if (other.task_id === task.task_id) continue;
+    if (other.lifecycle !== 'working' && other.lifecycle !== 'claimed') continue;
+    const mine = Array.isArray(task.writeScopes) ? task.writeScopes : [];
+    const theirs = Array.isArray(other.writeScopes) ? other.writeScopes : [];
+    if (mine.some((left) => theirs.some((right) => writeScopesOverlap(left, right)))) {
+      warnings.add(`write scopes overlap with ${other.task_id}`);
+    }
+  }
+  return {
+    // 官方：status === 'pending' && 依赖全 completed。本插件 pending 对应 open。
+    ready: task.lifecycle === 'open' && taskReady(tasks, task),
+    writeScopeWarnings: [...warnings],
+  };
+}
+
+/**
+ * 校验并归一化新任务（或改动后的依赖）的 blockedBy。
+ * 错误码对应官方 task-graph.ts 的三类违例：missing → TASK_NOT_FOUND、
+ * duplicate → INVALID_FIELD、cycle（自依赖）→ TASK_DEPENDENCY_CYCLE。
+ *
+ * 额外一条本插件口径：**已取消的任务不能当 blocker**（官方对应 deleted）。
+ * 取消是终局，永远不可能变成 completed，允许它当依赖等于制造一条永远解不开的锁链。
+ *
+ * @param {unknown[]} values 原始 blockedBy
+ * @param {Array<object>} tasks 全量任务
+ * @param {string|null} selfId 被改动任务的 id（新建时为 null）
+ * @returns {string[]} 去重后的 blocker id 列表
+ */
+export function validateDependencies(values, tasks, selfId = null) {
+  if (!Array.isArray(values)) {
+    throw new TeamError('INVALID_INPUT', 'blockedBy 必须是字符串数组（任务 id）');
+  }
+  const seen = new Set();
+  const result = [];
+  for (const raw of values) {
+    const id = assertNonEmptyString(raw, 'blockedBy 中的任务 id', 200);
+    if (selfId !== null && id === selfId) {
+      throw new TeamError('TASK_DEPENDENCY_CYCLE', `任务不能依赖自己：${id}`);
+    }
+    if (seen.has(id)) throw new TeamError('INVALID_FIELD', `blockedBy 里重复出现 ${id}`);
+    const blocker = tasks.find((candidate) => candidate.task_id === id);
+    if (blocker === undefined) {
+      throw new TeamError('TASK_NOT_FOUND', `blockedBy 里的任务不存在：${id}`);
+    }
+    if (blocker.lifecycle === 'canceled') {
+      throw new TeamError(
+        'TASK_NOT_FOUND',
+        `blockedBy 里的任务已取消：${id}（取消是终局，永远等不到它完成；请换一个 blocker 或去掉它）`,
+      );
+    }
+    seen.add(id);
+    result.push(id);
+  }
+  return result;
+}
+
+/**
+ * 全量依赖图校验 —— **照官方 task-graph.ts 的 assertTaskGraphCandidate**：
+ * 自依赖、重复依赖、缺失 blocker、成环。任何一条不成立都拒绝写入。
+ *
+ * 现在只有 create 一条写入路径（依赖在创建时定死），所以这条校验在 create-only
+ * 流程里抓不到环（缺 id 就建不出来，环需要"后加依赖"）。它保留的价值是：
+ *   - 防御未来任何新增的 set_dependencies / 板服务直调路径；
+ *   - 自依赖与重复依赖在 create 上确实可能发生，必须同一个函数判，不能两套口径。
+ *
+ * @param {Array<object>} tasks 全量任务（含候选任务）
+ * @param {{task_id:string, blockedBy:string[], lifecycle?:string}} candidate 候选快照
+ */
+export function assertTaskGraph(tasks, candidate) {
+  const byId = new Map();
+  for (const task of tasks) byId.set(task.task_id, task);
+  byId.set(candidate.task_id, candidate);
+
+  for (const task of byId.values()) {
+    if (task.lifecycle === 'canceled') continue;
+    const seen = new Set();
+    for (const blockerId of task.blockedBy ?? []) {
+      if (blockerId === task.task_id) {
+        throw new TeamError('TASK_DEPENDENCY_CYCLE', `任务 ${task.task_id} 不能依赖自己`);
+      }
+      if (seen.has(blockerId)) {
+        throw new TeamError('INVALID_FIELD', `任务 ${task.task_id} 重复依赖 ${blockerId}`);
+      }
+      const blocker = byId.get(blockerId);
+      if (blocker === undefined) {
+        throw new TeamError(
+          'TASK_NOT_FOUND',
+          `任务 ${task.task_id} 的依赖 ${blockerId} 不存在`,
+        );
+      }
+      // 已取消的 blocker：**允许作为历史遗留存在**（依赖方继续保持 blocked，见 README 已知限制）。
+      // 为什么不在全图校验里抛错：取消是 mesh 唯一的放弃路径，取消后若让"全图校验"报错，
+      // 会让**之后每一次 create 都失败**——一条历史欠账把整块板锁死，比留着一条死依赖糟得多。
+      // 新建任务引用已取消 blocker 仍然会在 validateDependencies 里被拒（那条才是意图，这条是历史）。
+      if (blocker.lifecycle === 'canceled') continue;
+      seen.add(blockerId);
+    }
+  }
+
+  const visiting = new Set();
+  const visited = new Set();
+  const visit = (id) => {
+    if (visiting.has(id)) throw new TeamError('TASK_DEPENDENCY_CYCLE', `依赖成环，包含 ${id}`);
+    if (visited.has(id)) return;
+    const task = byId.get(id);
+    if (task === undefined || task.lifecycle === 'canceled') return;
+    visiting.add(id);
+    for (const blockerId of task.blockedBy ?? []) visit(blockerId);
+    visiting.delete(id);
+    visited.add(id);
+  };
+  for (const task of byId.values()) visit(task.task_id);
+}
+
+/** 哪些**未终结**任务依赖了 taskId。cancel 时要如实告诉调用方"这会让谁继续被阻塞"。 */
+export function dependentTaskIds(tasks, taskId) {
+  return tasks
+    .filter((task) => task.task_id !== taskId
+      && task.lifecycle !== 'done'
+      && task.lifecycle !== 'canceled'
+      && Array.isArray(task.blockedBy)
+      && task.blockedBy.includes(taskId))
+    .map((task) => task.task_id);
 }
 
 /** 收件箱摘要：把事件写成一段人话，条数上限由调用方控制。 */

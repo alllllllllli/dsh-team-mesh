@@ -1,7 +1,7 @@
 {
   "name": "dsh-team-mesh",
-  "version": "0.6.1",
-  "description": "Cross-instance and cross-device task mesh for DeepSeek-Harness: shared SQLite board or remote HTTP board service, interconnect dispatch with ack receipts, claim leases with heartbeat, auto-injected inbox cursor with peer-noise filtering, and a completion gate that refuses model self-reports.",
+  "version": "0.7.0",
+  "description": "Cross-instance and cross-device task mesh for DeepSeek-Harness: shared SQLite board or remote HTTP board service, task dependencies (blockedBy), advisory write scopes, expectedRevision CAS, claim leases with heartbeat, three-evidence adoption, interconnect dispatch with ack receipts, completion gate that refuses model self-reports, wake-rate-limit, and a no-wait guard for mesh workers.",
   "keywords": [
     "dsh",
     "dsh-plugin",
